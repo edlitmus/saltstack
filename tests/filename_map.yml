@@ -204,6 +204,19 @@ salt/(client/ssh/.+|cli/ssh\.py):
   - pytests.integration.ssh.test_raw
   - integration.ssh.test_state
   - pytests.integration.ssh.test_py_versions
+  - pytests.integration.netapi.test_ssh_client
+
+salt/client/ssh/wrapper/*:
+  - pytests.integration.ssh.test_deploy
+  - pytests.integration.ssh.test_grains
+  - pytests.integration.ssh.test_mine
+  - pytests.integration.ssh.test_master
+  - pytests.integration.ssh.test_jinja_filters
+  - pytests.integration.ssh.test_pillar
+  - pytests.integration.ssh.test_raw
+  - integration.ssh.test_state
+  - pytests.integration.ssh.test_py_versions
+  - pytests.integration.netapi.test_ssh_client
 
 salt/config/*:
   - unit.test_config
@@ -309,6 +322,7 @@ salt/utils/vt.py:
   - pytests.integration.ssh.test_pillar
   - pytests.integration.ssh.test_raw
   - integration.ssh.test_state
+  - pytests.integration.netapi.test_ssh_client
 
 salt/wheel/*:
   - pytests.integration.wheel.test_client
@@ -322,6 +336,9 @@ salt/(minion\.py|channel/.+|transport/.+):
 
 tests/support/mock.py:
   - unit.test_mock
+
+tests/support/virt.py:
+  - pytests.integration.modules.test_virt
 
 tests/support/pytest/mysql.py:
   - pytests.functional.states.test_mysql

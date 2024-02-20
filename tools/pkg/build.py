@@ -94,8 +94,13 @@ def debian(
             os.environ[key] = value
             env_args.extend(["-e", key])
 
+    env = os.environ.copy()
+    env["PIP_CONSTRAINT"] = str(
+        tools.utils.REPO_ROOT / "requirements" / "constraints.txt"
+    )
+
     ctx.run("ln", "-sf", "pkg/debian/", ".")
-    ctx.run("debuild", *env_args, "-uc", "-us")
+    ctx.run("debuild", *env_args, "-uc", "-us", env=env)
 
     ctx.info("Done")
 
@@ -160,8 +165,14 @@ def rpm(
         for key, value in new_env.items():
             os.environ[key] = value
 
+    env = os.environ.copy()
+    env["PIP_CONSTRAINT"] = str(
+        tools.utils.REPO_ROOT / "requirements" / "constraints.txt"
+    )
     spec_file = checkout / "pkg" / "rpm" / "salt.spec"
-    ctx.run("rpmbuild", "-bb", f"--define=_salt_src {checkout}", str(spec_file))
+    ctx.run(
+        "rpmbuild", "-bb", f"--define=_salt_src {checkout}", str(spec_file), env=env
+    )
 
     ctx.info("Done")
 
@@ -433,7 +444,7 @@ def windows(
     arguments={
         "arch": {
             "help": "The architecture to build the package for",
-            "choices": ("x86_64", "aarch64", "x86", "amd64"),
+            "choices": ("x86_64", "arm64", "x86", "amd64"),
             "required": True,
         },
         "python_version": {
@@ -471,6 +482,12 @@ def onedir_dependencies(
         assert python_version is not None
         assert package_name is not None
         assert platform is not None
+
+    if platform == "darwin":
+        platform = "macos"
+
+    if platform != "macos" and arch == "arm64":
+        arch = "aarch64"
 
     shared_constants = _get_shared_constants()
     if not python_version:
@@ -545,33 +562,23 @@ def onedir_dependencies(
         / "static"
         / "pkg"
         / f"py{requirements_version}"
-        / f"{platform}.txt"
+        / f"{platform if platform != 'macos' else 'darwin'}.txt"
     )
     _check_pkg_build_files_exist(ctx, requirements_file=requirements_file)
 
+    env["PIP_CONSTRAINT"] = str(
+        tools.utils.REPO_ROOT / "requirements" / "constraints.txt"
+    )
     ctx.run(
         str(python_bin),
         "-m",
         "pip",
         "install",
         "-U",
+        "setuptools",
+        "pip",
         "wheel",
-    )
-    ctx.run(
-        str(python_bin),
-        "-m",
-        "pip",
-        "install",
-        "-U",
-        "pip>=22.3.1,<23.0",
-    )
-    ctx.run(
-        str(python_bin),
-        "-m",
-        "pip",
-        "install",
-        "-U",
-        "setuptools>=65.6.3,<66",
+        env=env,
     )
     ctx.run(
         str(python_bin),
@@ -617,6 +624,9 @@ def salt_onedir(
     if TYPE_CHECKING:
         assert platform is not None
         assert package_name is not None
+
+    if platform == "darwin":
+        platform = "macos"
 
     shared_constants = _get_shared_constants()
     if not relenv_version:
@@ -699,7 +709,7 @@ def salt_onedir(
             str(salt_archive),
             env=env,
         )
-        if platform == "darwin":
+        if platform == "macos":
 
             def errfn(fn, path, err):
                 ctx.info(f"Removing {path} failed: {err}")
