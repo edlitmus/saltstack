@@ -778,7 +778,6 @@ def test_issue_8947_utf8_sls(modules, tmp_path, state_tree, subtests):
 @pytest.mark.skip_if_not_root
 @pytest.mark.skip_on_windows(reason="Windows does not support setuid. Skipping.")
 def test_owner_after_setuid(file, modules, tmp_path, state_file_account):
-
     """
     Test to check file user/group after setting setuid or setgid.
     Because Python os.chown() does reset the setuid/setgid to 0.
@@ -1043,3 +1042,15 @@ def test_issue_60203(
     assert "Unable to manage file" in ret.comment
     assert "/files/test.tar.gz.sha256" in ret.comment
     assert "dontshowme" not in ret.comment
+
+
+def test_file_managed_new_file_diff(file, tmp_path):
+    name = tmp_path / "new_file_diff.txt"
+    ret = file.managed(str(name), contents="EITR", new_file_diff=True, test=True)
+    assert ret.changes == {
+        "diff": f"--- \n+++ \n@@ -0,0 +1 @@\n+EITR{os.linesep}",
+    }
+    assert not name.exists()
+    ret = file.managed(str(name), contents="EITR", new_file_diff=True)
+    assert ret.changes == {"diff": f"--- \n+++ \n@@ -0,0 +1 @@\n+EITR{os.linesep}"}
+    assert name.exists()

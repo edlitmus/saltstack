@@ -36,7 +36,6 @@ old.
 
 """
 
-
 import collections
 import datetime
 import errno
@@ -48,6 +47,7 @@ import time
 import urllib.parse
 from functools import cmp_to_key
 
+import salt.fileserver
 import salt.payload
 import salt.syspaths
 import salt.utils.args
@@ -908,7 +908,7 @@ def refresh_db(**kwargs):
     The database is stored in a serialized format located by default at the
     following location:
 
-    ``C:\salt\var\cache\salt\minion\files\base\win\repo-ng\winrepo.p``
+    ``C:\ProgramData\Salt Project\Salt\var\cache\salt\minion\files\base\win\repo-ng\winrepo.p``
 
     This module performs the following steps to generate the software metadata
     database:
@@ -916,7 +916,7 @@ def refresh_db(**kwargs):
     - Fetch the package definition files (.sls) from `winrepo_source_dir`
       (default `salt://win/repo-ng`) and cache them in
       `<cachedir>\files\<saltenv>\<winrepo_source_dir>`
-      (default: ``C:\salt\var\cache\salt\minion\files\base\win\repo-ng``)
+      (default: ``C:\ProgramData\Salt Project\Salt\var\cache\salt\minion\files\base\win\repo-ng``)
     - Call :py:func:`pkg.genrepo <salt.modules.win_pkg.genrepo>` to parse the
       package definition files and generate the repository metadata database
       file (`winrepo.p`)
@@ -977,7 +977,7 @@ def refresh_db(**kwargs):
 
     .. warning::
         When calling this command from a state using `module.run` be sure to
-        pass `failhard: False`. Otherwise the state will report failure if it
+        pass `failhard: False`. Otherwise, the state will report failure if it
         encounters a bad software definition file.
 
     CLI Example:
@@ -1020,6 +1020,11 @@ def refresh_db(**kwargs):
         raise CommandExecutionError(
             "Failed to clear one or more winrepo cache files", info={"failed": failed}
         )
+
+    # Clear the cache so that newly copied package definitions will be picked up
+    fileserver = salt.fileserver.Fileserver(__opts__)
+    load = {"saltenv": saltenv, "fsbackend": None}
+    fileserver.clear_file_list_cache(load=load)
 
     # Cache repo-ng locally
     log.info("Fetching *.sls files from %s", repo_details.winrepo_source_dir)
@@ -1171,10 +1176,11 @@ def genrepo(**kwargs):
             if name.endswith(".sls"):
                 total_files_processed += 1
                 _repo_process_pkg_sls(
-                    os.path.join(root, name),
-                    os.path.join(short_path, name),
-                    ret,
-                    successful_verbose,
+                    filename=os.path.join(root, name),
+                    short_path_name=os.path.join(short_path, name),
+                    ret=ret,
+                    successful_verbose=successful_verbose,
+                    saltenv=saltenv,
                 )
 
     with salt.utils.files.fopen(repo_details.winrepo_file, "wb") as repo_cache:
@@ -1213,7 +1219,9 @@ def genrepo(**kwargs):
         return results
 
 
-def _repo_process_pkg_sls(filename, short_path_name, ret, successful_verbose):
+def _repo_process_pkg_sls(
+    filename, short_path_name, ret, successful_verbose, saltenv="base"
+):
     renderers = salt.loader.render(__opts__, __salt__)
 
     def _failed_compile(prefix_msg, error_msg):
@@ -1228,6 +1236,7 @@ def _repo_process_pkg_sls(filename, short_path_name, ret, successful_verbose):
             __opts__["renderer"],
             __opts__.get("renderer_blacklist", ""),
             __opts__.get("renderer_whitelist", ""),
+            saltenv=saltenv,
         )
     except SaltRenderError as exc:
         return _failed_compile("Failed to compile", exc)
@@ -1648,7 +1657,7 @@ def install(name=None, refresh=False, pkgs=None, **kwargs):
             # single files
             if cache_dir and installer.startswith("salt:"):
                 path, _ = os.path.split(installer)
-                log.debug(f"PKG: Caching directory: {path}")
+                log.debug("PKG: Caching directory: %s", path)
                 try:
                     __salt__["cp.cache_dir"](
                         path=path,
@@ -1665,7 +1674,7 @@ def install(name=None, refresh=False, pkgs=None, **kwargs):
             # Check to see if the cache_file is cached... if passed
             if cache_file and cache_file.startswith("salt:"):
                 cache_file_hash = __salt__["cp.hash_file"](cache_file, saltenv)
-                log.debug(f"PKG: Caching file: {cache_file}")
+                log.debug("PKG: Caching file: %s", cache_file)
                 try:
                     cached_file = __salt__["cp.cache_file"](
                         cache_file,
@@ -1695,7 +1704,7 @@ def install(name=None, refresh=False, pkgs=None, **kwargs):
                 # file if the source_hash doesn't match, which only works on
                 # files hosted on "salt://". If the http/https url supports
                 # etag, it should also verify that information before caching
-                log.debug(f"PKG: Caching file: {installer}")
+                log.debug("PKG: Caching file: %s", installer)
                 try:
                     cached_pkg = __salt__["cp.cache_file"](
                         installer,
@@ -2092,7 +2101,7 @@ def remove(name=None, pkgs=None, **kwargs):
 
                 if cache_dir and uninstaller.startswith("salt:"):
                     path, _ = os.path.split(uninstaller)
-                    log.debug(f"PKG: Caching dir: {path}")
+                    log.debug("PKG: Caching dir: %s", path)
                     try:
                         __salt__["cp.cache_dir"](
                             path=path,
@@ -2116,7 +2125,7 @@ def remove(name=None, pkgs=None, **kwargs):
                     # only works on files hosted on "salt://". If the http/https
                     # url supports etag, it should also verify that information
                     # before caching
-                    log.debug(f"PKG: Caching file: {uninstaller}")
+                    log.debug("PKG: Caching file: %s", uninstaller)
                     try:
                         cached_pkg = __salt__["cp.cache_file"](
                             uninstaller,
@@ -2360,7 +2369,23 @@ def _get_name_map(saltenv="base"):
 
 def get_package_info(name, saltenv="base"):
     """
-    Return package info. Returns empty map if package not available.
+    Get information about the package as found in the winrepo database
+
+    Args:
+
+        name (str): The name of the package
+
+        saltenv (str): The salt environment to use. Default is "base"
+
+    Returns:
+        dict: A dictionary of package info, empty if package not available
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' pkg.get_package_info chrome
+
     """
     return _get_package_info(name=name, saltenv=saltenv)
 

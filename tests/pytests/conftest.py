@@ -2,6 +2,7 @@
     tests.pytests.conftest
     ~~~~~~~~~~~~~~~~~~~~~~
 """
+
 import asyncio
 import functools
 import inspect
@@ -54,7 +55,7 @@ def salt_eauth_account_factory():
 
 @pytest.fixture(scope="session")
 def salt_auto_account_factory():
-    return TestAccount(username="saltdev_auto", password="saltdev")
+    return TestAccount(username="saltdev-auto")
 
 
 @pytest.fixture(scope="session")
@@ -647,6 +648,7 @@ def io_loop():
 
 
 # <---- Async Test Fixtures ------------------------------------------------------------------------------------------
+
 
 # ----- Helpers ----------------------------------------------------------------------------------------------------->
 @pytest.helpers.proxy.register

@@ -3,7 +3,6 @@ import logging
 import os
 import re
 import shutil
-import tempfile
 import time
 
 import pytest
@@ -15,6 +14,10 @@ import salt.utils.platform
 
 log = logging.getLogger(__name__)
 
+pytestmark = [
+    pytest.mark.timeout_unless_on_windows(240),
+]
+
 
 @pytest.fixture
 def ctx():
@@ -22,25 +25,24 @@ def ctx():
 
 
 @pytest.fixture
-def preserve_rhel_yum_conf():
+def _preserve_rhel_yum_conf(tmp_path):
 
     # save off current yum.conf
     cfg_file = "/etc/yum.conf"
     if not os.path.exists(cfg_file):
         pytest.skip("Only runs on RedHat.")
 
-    tmp_dir = str(tempfile.gettempdir())
-    tmp_file = os.path.join(tmp_dir, "yum.conf")
+    tmp_file = tmp_path / "yum.conf"
     shutil.copy2(cfg_file, tmp_file)
-    yield
-
-    # restore saved yum.conf
-    shutil.copy2(tmp_file, cfg_file)
-    os.remove(tmp_file)
+    try:
+        yield
+    finally:
+        # restore saved yum.conf
+        shutil.copy2(tmp_file, cfg_file)
 
 
 @pytest.fixture
-def refresh_db(ctx, grains, modules):
+def _refresh_db(ctx, grains, modules):
     if "refresh" not in ctx:
         modules.pkg.refresh_db()
         ctx["refresh"] = True
@@ -73,9 +75,10 @@ def test_pkg(grains):
     return _pkg
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.requires_salt_modules("pkg.list_pkgs")
 @pytest.mark.slow_test
-def test_list(modules, refresh_db):
+def test_list(modules):
     """
     verify that packages are installed
     """
@@ -107,11 +110,12 @@ def test_version_cmp(grains, modules):
     assert modules.pkg.version_cmp(*gt) == 1
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.destructive_test
 @pytest.mark.requires_salt_modules("pkg.mod_repo", "pkg.del_repo", "pkg.get_repo")
 @pytest.mark.slow_test
 @pytest.mark.requires_network
-def test_mod_del_repo(grains, modules, refresh_db):
+def test_mod_del_repo(grains, modules):
     """
     test modifying and deleting a software repository
     """
@@ -161,7 +165,8 @@ def test_mod_del_repo(grains, modules, refresh_db):
 
 
 @pytest.mark.slow_test
-def test_mod_del_repo_multiline_values(modules, refresh_db):
+@pytest.mark.usefixtures("_refresh_db")
+def test_mod_del_repo_multiline_values(modules):
     """
     test modifying and deleting a software repository defined with multiline values
     """
@@ -175,7 +180,6 @@ def test_mod_del_repo_multiline_values(modules, refresh_db):
             expected_get_repo_baseurl = (
                 "http://my.fake.repo/foo/bar/\nhttp://my.fake.repo.alt/foo/bar/"
             )
-            major_release = int(modules.grains.item("osmajorrelease")["osmajorrelease"])
             repo = "fakerepo"
             name = "Fake repo for RHEL/CentOS/SUSE"
             baseurl = my_baseurl
@@ -220,20 +224,24 @@ def test_owner(modules):
 # Similar to pkg.owner, but for FreeBSD's pkgng
 @pytest.mark.skip_on_freebsd(reason="test for new package manager for FreeBSD")
 @pytest.mark.requires_salt_modules("pkg.which")
-def test_which(modules):
+def test_which(grains, modules):
     """
     test finding the package owning a file
     """
-    func = "pkg.which"
-    ret = modules.pkg.which("/usr/local/bin/salt-call")
+    if grains["os_family"] in ["Debian", "RedHat"]:
+        file = "/bin/mknod"
+    else:
+        file = "/usr/local/bin/salt-call"
+    ret = modules.pkg.which(file)
     assert len(ret) != 0
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.destructive_test
 @pytest.mark.requires_salt_modules("pkg.version", "pkg.install", "pkg.remove")
 @pytest.mark.slow_test
 @pytest.mark.requires_network
-def test_install_remove(modules, test_pkg, refresh_db):
+def test_install_remove(modules, test_pkg):
     """
     successfully install and uninstall a package
     """
@@ -258,6 +266,7 @@ def test_install_remove(modules, test_pkg, refresh_db):
         test_remove()
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.destructive_test
 @pytest.mark.skip_on_photonos(
     reason="package hold/unhold unsupported on Photon OS",
@@ -273,7 +282,7 @@ def test_install_remove(modules, test_pkg, refresh_db):
 @pytest.mark.slow_test
 @pytest.mark.requires_network
 @pytest.mark.requires_salt_states("pkg.installed")
-def test_hold_unhold(grains, modules, states, test_pkg, refresh_db):
+def test_hold_unhold(grains, modules, states, test_pkg):
     """
     test holding and unholding a package
     """
@@ -315,11 +324,12 @@ def test_hold_unhold(grains, modules, states, test_pkg, refresh_db):
             assert ret.result is True
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.destructive_test
 @pytest.mark.requires_salt_modules("pkg.refresh_db")
 @pytest.mark.slow_test
 @pytest.mark.requires_network
-def test_refresh_db(grains, tmp_path, minion_opts, refresh_db):
+def test_refresh_db(grains, minion_opts):
     """
     test refreshing the package database
     """
@@ -344,9 +354,10 @@ def test_refresh_db(grains, tmp_path, minion_opts, refresh_db):
     assert os.path.isfile(rtag) is False
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.requires_salt_modules("pkg.info_installed")
 @pytest.mark.slow_test
-def test_pkg_info(grains, modules, test_pkg, refresh_db):
+def test_pkg_info(grains, modules, test_pkg):
     """
     Test returning useful information on Ubuntu systems.
     """
@@ -371,6 +382,7 @@ def test_pkg_info(grains, modules, test_pkg, refresh_db):
         assert test_pkg in keys
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.skipif(True, reason="Temporary Skip - Causes centos 8 test to fail")
 @pytest.mark.destructive_test
 @pytest.mark.requires_salt_modules(
@@ -382,7 +394,7 @@ def test_pkg_info(grains, modules, test_pkg, refresh_db):
 )
 @pytest.mark.slow_test
 @pytest.mark.requires_network
-def test_pkg_upgrade_has_pending_upgrades(grains, modules, test_pkg, refresh_db):
+def test_pkg_upgrade_has_pending_upgrades(grains, modules):
     """
     Test running a system upgrade when there are packages that need upgrading
     """
@@ -450,6 +462,7 @@ def test_pkg_upgrade_has_pending_upgrades(grains, modules, test_pkg, refresh_db)
             assert ret != {}
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.destructive_test
 @pytest.mark.skip_on_darwin(
     reason="The jenkins user is equivalent to root on mac, causing the test to be unrunnable"
@@ -457,7 +470,7 @@ def test_pkg_upgrade_has_pending_upgrades(grains, modules, test_pkg, refresh_db)
 @pytest.mark.requires_salt_modules("pkg.remove", "pkg.latest_version")
 @pytest.mark.slow_test
 @pytest.mark.requires_salt_states("pkg.removed")
-def test_pkg_latest_version(grains, modules, states, test_pkg, refresh_db):
+def test_pkg_latest_version(grains, modules, states, test_pkg):
     """
     Check that pkg.latest_version returns the latest version of the uninstalled package.
     The package is not installed. Only the package version is checked.
@@ -493,10 +506,11 @@ def test_pkg_latest_version(grains, modules, states, test_pkg, refresh_db):
     assert pkg_latest in cmd_pkg
 
 
+@pytest.mark.usefixtures("_preserve_rhel_yum_conf")
 @pytest.mark.destructive_test
 @pytest.mark.requires_salt_modules("pkg.list_repos")
 @pytest.mark.slow_test
-def test_list_repos_duplicate_entries(preserve_rhel_yum_conf, grains, modules):
+def test_list_repos_duplicate_entries(grains, modules):
     """
     test duplicate entries in /etc/yum.conf
 
@@ -527,13 +541,13 @@ def test_list_repos_duplicate_entries(preserve_rhel_yum_conf, grains, modules):
     # test explicitly strict_config
     expected = "While reading from '/etc/yum.conf' [line  8]: option 'http_caching' in section 'main' already exists"
     with pytest.raises(configparser.DuplicateOptionError) as exc_info:
-        result = modules.pkg.list_repos(strict_config=True)
-    assert f"{exc_info.value}" == expected
+        modules.pkg.list_repos(strict_config=True)
+    assert str(exc_info.value) == expected
 
     # test implicitly strict_config
     with pytest.raises(configparser.DuplicateOptionError) as exc_info:
-        result = modules.pkg.list_repos()
-    assert f"{exc_info.value}" == expected
+        modules.pkg.list_repos()
+    assert str(exc_info.value) == expected
 
 
 @pytest.mark.destructive_test

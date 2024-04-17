@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 
 import pytest
+from saltfactories.utils import random_string
 
 from tests.support.runtests import RUNTIME_VARS
 
@@ -14,7 +15,7 @@ pytestmark = [
 
 
 @pytest.fixture(scope="module", autouse=True)
-def pillar_tree(base_env_pillar_tree_root_dir):
+def _pillar_tree(salt_master):
     top_file = """
     base:
       'localhost':
@@ -27,14 +28,9 @@ def pillar_tree(base_env_pillar_tree_root_dir):
     alot: many
     script: grail
     """
-    top_tempfile = pytest.helpers.temp_file(
-        "top.sls", top_file, base_env_pillar_tree_root_dir
-    )
-    basic_tempfile = pytest.helpers.temp_file(
-        "basic.sls", basic_pillar_file, base_env_pillar_tree_root_dir
-    )
-
-    with top_tempfile, basic_tempfile:
+    with salt_master.pillar_tree.base.temp_file(
+        "top.sls", top_file
+    ), salt_master.pillar_tree.base.temp_file("basic.sls", basic_pillar_file):
         yield
 
 
@@ -88,20 +84,20 @@ def test_get_file(salt_ssh_cli, tmp_path, template, dst_is_dir, cachedir):
     )
     for path in (tgt, master_path):
         assert path.exists()
-        data = path.read_text()
+        data = path.read_text(encoding="utf-8")
         assert "Gromit" in data
         assert "bacon" not in data
 
 
 def test_get_file_gzipped(salt_ssh_cli, caplog, tmp_path):
-    tgt = tmp_path / "foo"
+    tgt = tmp_path / random_string("foo-")
     res = salt_ssh_cli.run("cp.get_file", "salt://grail/scene33", str(tgt), gzip=5)
     assert res.returncode == 0
     assert res.data
     assert res.data == str(tgt)
     assert "The gzip argument to cp.get_file in salt-ssh is unsupported" in caplog.text
     assert tgt.exists()
-    data = tgt.read_text()
+    data = tgt.read_text(encoding="utf-8")
     assert "KNIGHT:  They're nervous, sire." in data
     assert "bacon" not in data
 
@@ -125,7 +121,7 @@ def test_get_file_makedirs(salt_ssh_cli, tmp_path, cachedir):
     )
     for path in (tgt, master_path):
         assert path.exists()
-        data = path.read_text()
+        data = path.read_text(encoding="utf-8")
         assert "KNIGHT:  They're nervous, sire." in data
         assert "bacon" not in data
 
@@ -137,7 +133,7 @@ def test_get_file_from_env(salt_ssh_cli, tmp_path, suffix):
     assert ret.returncode == 0
     assert ret.data
     assert ret.data == str(tgt)
-    data = tgt.read_text()
+    data = tgt.read_text(encoding="utf-8")
     assert "Gromit" in data
     assert ("Comte" in data) is bool(suffix)
 
@@ -175,7 +171,7 @@ def test_get_template(salt_ssh_cli, tmp_path, cachedir):
     )
     for path in (tgt, master_path):
         assert tgt.exists()
-        data = tgt.read_text()
+        data = tgt.read_text(encoding="utf-8")
         assert "bacon" in data
         assert "spam" not in data
 
@@ -198,7 +194,7 @@ def test_get_template_dest_empty(salt_ssh_cli, cachedir):
     assert res.data == str(tgt)
     for file in (tgt, master_path):
         assert file.exists()
-        data = file.read_text()
+        data = file.read_text(encoding="utf-8")
         assert "bacon" in data
         assert "spam" not in data
 
@@ -293,7 +289,7 @@ def test_get_url(salt_ssh_cli, tmp_path, dst_is_dir, cachedir):
     )
     for file in (tgt, master_path):
         assert file.exists()
-        data = file.read_text()
+        data = file.read_text(encoding="utf-8")
         assert "KNIGHT:  They're nervous, sire." in data
         assert "bacon" not in data
 
@@ -317,7 +313,7 @@ def test_get_url_makedirs(salt_ssh_cli, tmp_path, cachedir):
     )
     for file in (tgt, master_path):
         assert file.exists()
-        data = file.read_text()
+        data = file.read_text(encoding="utf-8")
         assert "KNIGHT:  They're nervous, sire." in data
         assert "bacon" not in data
 
@@ -343,7 +339,7 @@ def test_get_url_dest_empty(salt_ssh_cli, cachedir):
     assert res.data == str(tgt)
     for file in (tgt, master_path):
         assert file.exists()
-        data = file.read_text()
+        data = file.read_text(encoding="utf-8")
         assert "KNIGHT:  They're nervous, sire." in data
         assert "bacon" not in data
 
@@ -387,7 +383,7 @@ def test_get_url_https(salt_ssh_cli, tmp_path, cachedir):
     )
     for path in (tgt, master_path):
         assert path.exists()
-        data = path.read_text()
+        data = path.read_text(encoding="utf-8")
         assert "Salt Project" in data
         assert "Package" in data
         assert "Repo" in data
@@ -414,7 +410,7 @@ def test_get_url_https_dest_empty(salt_ssh_cli, tmp_path, cachedir):
     assert res.data == str(tgt)
     for path in (tgt, master_path):
         assert path.exists()
-        data = path.read_text()
+        data = path.read_text(encoding="utf-8")
         assert "Salt Project" in data
         assert "Package" in data
         assert "Repo" in data
@@ -500,7 +496,7 @@ def test_get_url_ftp(salt_ssh_cli, tmp_path, cachedir):
     )
     for path in (tgt, master_path):
         assert path.exists()
-        data = path.read_text()
+        data = path.read_text(encoding="utf-8")
         assert "The official FreeBSD" in data
 
 
@@ -515,7 +511,7 @@ def test_get_file_str_salt(salt_ssh_cli, cachedir):
     master_path = _convert(salt_ssh_cli, cachedir, tgt, master=True)
     for path in (tgt, master_path):
         assert path.exists()
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         assert "KNIGHT:  They're nervous, sire." in text
 
 
@@ -540,7 +536,7 @@ def test_get_file_str_https(salt_ssh_cli, cachedir):
     master_path = _convert(salt_ssh_cli, cachedir, tgt, master=True)
     for path in (tgt, master_path):
         assert path.exists()
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         assert "Salt Project" in text
         assert "Package" in text
         assert "Repo" in text
@@ -572,13 +568,14 @@ def test_cache_file(salt_ssh_cli, suffix, cachedir):
     )
     master_path = _convert(salt_ssh_cli, cachedir, tgt, master=True)
     for file in (tgt, master_path):
-        data = file.read_text()
+        data = file.read_text(encoding="utf-8")
         assert "Gromit" in data
         assert ("Comte" in data) is bool(suffix)
 
 
 @pytest.fixture
-def _cache_twice(base_env_state_tree_root_dir, request, salt_ssh_cli, cachedir):
+def _cache_twice(salt_master, request, salt_ssh_cli, cachedir):
+
     # ensure the cache is clean
     tgt = cachedir / "extrn_files" / "base" / "repo.saltproject.io" / "index.html"
     tgt.unlink(missing_ok=True)
@@ -609,7 +606,7 @@ def _cache_twice(base_env_state_tree_root_dir, request, salt_ssh_cli, cachedir):
 {{%- set res2 = salt["cp.cache_file"]("{src}") %}}
 {{{{ res2 }}}}
     """
-    with pytest.helpers.temp_file(name, contents, base_env_state_tree_root_dir):
+    with salt_master.state_tree.base.temp_file(name, contents):
         yield f"salt://{name}"
 
 
@@ -622,7 +619,7 @@ def test_cache_file_context_cache(salt_ssh_cli, cachedir, _cache_twice):
     for file in (tgt, _convert(salt_ssh_cli, cachedir, tgt, master=True)):
         assert tgt.exists()
         # If both files were present, they should not be re-fetched
-        assert "wasmodifiedhahaha" in tgt.read_text()
+        assert "wasmodifiedhahaha" in tgt.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("_cache_twice", ("master", "minion"), indirect=True)
@@ -637,7 +634,7 @@ def test_cache_file_context_cache_requires_both_caches(
     for file in (tgt, _convert(salt_ssh_cli, cachedir, tgt, master=True)):
         assert tgt.exists()
         # If one of the files was removed, it should be re-fetched
-        assert "wasmodifiedhahaha" not in tgt.read_text()
+        assert "wasmodifiedhahaha" not in tgt.read_text(encoding="utf-8")
 
 
 def test_cache_file_nonexistent_source(salt_ssh_cli):
@@ -663,7 +660,7 @@ def test_cache_files(salt_ssh_cli, files):
         assert isinstance(path, str)
         path = Path(path)
         assert path.exists()
-        data = Path(path).read_text()
+        data = Path(path).read_text(encoding="utf-8")
         assert "ARTHUR:" in data
         assert "bacon" not in data
 
@@ -695,24 +692,22 @@ def test_cache_dir_nonexistent_source(salt_ssh_cli, caplog):
     assert not res.data
 
 
-def test_list_states(salt_ssh_cli, tmp_path, base_env_state_tree_root_dir):
+def test_list_states(salt_master, salt_ssh_cli, tmp_path):
     top_sls = """
     base:
       '*':
         - core
         """
-    tgt = tmp_path / "testfile"
-
     core_state = f"""
-    {tgt}/testfile:
+    {tmp_path / "testfile"}/testfile:
       file.managed:
         - source: salt://testfile
         - makedirs: true
         """
 
-    with pytest.helpers.temp_file(
-        "top.sls", top_sls, base_env_state_tree_root_dir
-    ), pytest.helpers.temp_file("core.sls", core_state, base_env_state_tree_root_dir):
+    with salt_master.state_tree.base.temp_file(
+        "top.sls", top_sls
+    ), salt_master.state_tree.base.temp_file("core.sls", core_state):
         res = salt_ssh_cli.run(
             "cp.list_states",
         )
@@ -757,22 +752,19 @@ def test_list_master_dirs(salt_ssh_cli):
         assert path not in res.data
 
 
-def test_list_master_symlinks(salt_ssh_cli, base_env_state_tree_root_dir):
+def test_list_master_symlinks(salt_ssh_cli, salt_master):
     if salt_ssh_cli.config.get("fileserver_ignoresymlinks", False):
         pytest.skip("Fileserver is configured to ignore symlinks")
-    with pytest.helpers.temp_file("foo", "", base_env_state_tree_root_dir) as tgt:
+    with salt_master.state_tree.base.temp_file(random_string("foo-"), "") as tgt:
         sym = tgt.parent / "test_list_master_symlinks"
-        try:
-            sym.symlink_to(tgt)
-            res = salt_ssh_cli.run("cp.list_master_symlinks")
-            assert res.returncode == 0
-            assert res.data
-            assert isinstance(res.data, dict)
-            assert res.data
-            assert sym.name in res.data
-            assert res.data[sym.name] == str(tgt)
-        finally:
-            sym.unlink()
+        sym.symlink_to(tgt)
+        res = salt_ssh_cli.run("cp.list_master_symlinks")
+        assert res.returncode == 0
+        assert res.data
+        assert isinstance(res.data, dict)
+        assert res.data
+        assert sym.name in res.data
+        assert res.data[sym.name] == str(tgt)
 
 
 @pytest.fixture(params=(False, "cached", "render_cached"))
@@ -857,9 +849,7 @@ def test_hash_file_local(salt_ssh_cli, caplog):
 
 
 @pytest.fixture
-def state_tree_jinjaimport(base_env_state_tree_root_dir, tmp_path):
-    tgt = tmp_path / "config.conf"
-    base_path = base_env_state_tree_root_dir / "my"
+def state_tree_jinjaimport(tmp_path, salt_master):
     map_contents = """{%- set mapdata = {"foo": "bar"} %}"""
     managed_contents = """
         {%- from "my/map.jinja" import mapdata with context %}
@@ -870,18 +860,18 @@ def state_tree_jinjaimport(base_env_state_tree_root_dir, tmp_path):
 
 Serialize config:
   file.managed:
-    - name: {tgt}
+    - name: {tmp_path / "config.conf"}
     - source: salt://my/files/config.conf.j2
     - template: jinja
 """
-    with pytest.helpers.temp_file(
-        "file_managed_import.sls", state_contents, base_path
-    ) as state:
-        with pytest.helpers.temp_file("map.jinja", map_contents, base_path):
-            with pytest.helpers.temp_file(
-                "config.conf.j2", managed_contents, base_path / "files"
-            ):
-                yield f"my.{state.stem}"
+    with salt_master.state_tree.base.temp_file(
+        "my/file_managed_import.sls", state_contents
+    ) as state, salt_master.state_tree.base.temp_file(
+        "my/map.jinja", map_contents
+    ), salt_master.state_tree.base.temp_file(
+        "my/files/config.conf.j2", managed_contents
+    ):
+        yield f"my.{state.stem}"
 
 
 def test_cp_cache_file_as_workaround_for_missing_map_file(
@@ -893,4 +883,4 @@ def test_cp_cache_file_as_workaround_for_missing_map_file(
     assert isinstance(ret.data, dict)
     assert ret.data
     assert tgt.exists()
-    assert tgt.read_text().strip() == "bar"
+    assert tgt.read_text(encoding="utf-8").strip() == "bar"

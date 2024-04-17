@@ -1,7 +1,12 @@
 """
 Tests using nginx formula
 """
+
 import pytest
+
+pytestmark = [
+    pytest.mark.timeout_unless_on_windows(120),
+]
 
 
 @pytest.fixture(scope="module")
@@ -20,6 +25,10 @@ def modules(loaders, _formula):
 
 @pytest.mark.skip_on_windows
 @pytest.mark.destructive_test
+@pytest.mark.skipif(
+    'grains["os_family"] == "Suse"',
+    reason="Zypperpkg module removed as a part of great module migration",
+)
 def test_formula(modules):
     ret = modules.state.sls("nginx")
     assert not ret.errors
