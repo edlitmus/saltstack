@@ -1,5 +1,6 @@
-setuptools >= 65.6.3,< 69.0
-setuptools-scm < 8.0.0
-pip >= 23.3,< 24.0
-# Restrict to a version that works on all supported python versions so salt-ssh can run on older targets
-networkx >= 3.0,< 3.2
+# IMPORTANT: The versions here must be compatible with the environment where
+# uv-pre-commit hooks run. We do not pin setuptools in .pre-commit-config.yaml
+# to allow uv to resolve a version that satisfies these constraints.
+wheel >= 0.46.3
+setuptools >= 80.10.2
+pip == 25.2

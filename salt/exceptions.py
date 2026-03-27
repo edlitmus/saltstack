@@ -350,6 +350,12 @@ class TokenAuthenticationError(SaltException):
     """
 
 
+class TokenExpiredError(SaltException):
+    """
+    Thrown when token is expired
+    """
+
+
 class SaltDeserializationError(SaltException):
     """
     Thrown when salt cannot deserialize data.
@@ -359,6 +365,12 @@ class SaltDeserializationError(SaltException):
 class AuthorizationError(SaltException):
     """
     Thrown when runner or wheel execution fails due to permissions
+    """
+
+
+class SaltValidationError(SaltException):
+    """
+    Thrown when a value fails validation
     """
 
 

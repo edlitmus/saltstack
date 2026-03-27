@@ -37,6 +37,8 @@ Pipfile.lock
 /tests/unit/templates/roots/
 /var/
 /.?venv/
+/venv/
+/doc/man/*
 
 # setuptools stuff
 *.egg-info
@@ -90,6 +92,7 @@ tests/unit/templates/roots
 # Pycharm
 .idea
 venv/
+.venv/
 
 # VS Code
 .vscode
@@ -142,3 +145,13 @@ nox.*.tar.xz
 /pkg/debian/debhelper-build-stamp
 
 .tools-venvs
+
+# AI Agent instruction files (templates are in agents/)
+/CLAUDE.md
+/GEMINI.md
+/CURSOR.md
+/COPILOT.md
+/.cursorrules
+/.aiderignore
+/aider.conf.yml
+/.gemini

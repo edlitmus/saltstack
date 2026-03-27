@@ -11,6 +11,7 @@ import pathlib
 import sys
 import tempfile
 import traceback
+from collections import OrderedDict
 
 import jinja2
 import jinja2.ext
@@ -31,7 +32,6 @@ from salt import __path__ as saltpath
 from salt.exceptions import CommandExecutionError, SaltInvocationError, SaltRenderError
 from salt.loader.context import NamedLoaderContext
 from salt.utils.decorators.jinja import JinjaFilter, JinjaGlobal, JinjaTest
-from salt.utils.odict import OrderedDict
 from salt.utils.versions import Version
 
 log = logging.getLogger(__name__)
@@ -105,8 +105,9 @@ def generate_sls_context(tmplpath, sls):
 
     sls_context = {}
 
-    # Normalize SLS as path.
-    slspath = sls.replace(".", "/")
+    # Normalize SLS as path and remove possible trailing slashes
+    # to prevent matching issues and wrong vars calculation
+    slspath = sls.replace(".", "/").rstrip("/")
 
     if tmplpath:
         # Normalize template path
@@ -120,8 +121,16 @@ def generate_sls_context(tmplpath, sls):
         elif template.endswith(f"{slspath}/init.sls"):
             template = template[-(9 + len(slspath)) :]
         else:
-            # Something went wrong
-            log.warning("Failed to determine proper template path")
+            # It is not an SLS file being processed
+            template = sls
+            sls_context.update(
+                dict(
+                    tplpath=tmplpath,
+                    tplfile=template,
+                    tpldir=str(pathlib.Path(sls).parents[0].as_posix()),
+                )
+            )
+            return sls_context
 
         slspath = template.rsplit("/", 1)[0] if "/" in template else ""
 

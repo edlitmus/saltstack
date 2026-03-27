@@ -11,6 +11,7 @@ import os
 import re
 import time
 import types
+from collections import OrderedDict
 
 import salt.config
 import salt.defaults.events
@@ -22,11 +23,10 @@ import salt.utils.data
 import salt.utils.dictupdate
 import salt.utils.files
 import salt.utils.lazy
-import salt.utils.odict
 import salt.utils.platform
 import salt.utils.stringutils
 import salt.utils.versions
-from salt.exceptions import LoaderError
+from salt.exceptions import LoaderError, SaltDeserializationError
 from salt.template import check_render_pipe_str
 from salt.utils import entrypoints
 
@@ -250,17 +250,7 @@ def _module_dirs(
         if os.path.isdir(maybe_dir):
             cli_module_dirs.insert(0, maybe_dir)
 
-    if opts.get("features", {}).get(
-        "enable_deprecated_module_search_path_priority", False
-    ):
-        salt.utils.versions.warn_until(
-            3008,
-            "The old module search path priority will be removed in Salt 3008. "
-            "For more information see https://github.com/saltstack/salt/pull/65938.",
-        )
-        return cli_module_dirs + ext_type_types + ext_types + sys_types
-    else:
-        return cli_module_dirs + ext_types + ext_type_types + sys_types
+    return cli_module_dirs + ext_types + ext_type_types + sys_types
 
 
 def minion_mods(
@@ -979,7 +969,20 @@ def render(
             "the needed software is unavailable".format(opts["renderer"])
         )
         log.critical(err)
-        raise LoaderError(err)
+        if opts.get("__role") == "minion":
+            default_renderer_config = salt.config.DEFAULT_MINION_OPTS["renderer"]
+        else:
+            default_renderer_config = salt.config.DEFAULT_MASTER_OPTS["renderer"]
+        log.warning(
+            "Attempting fallback to default render pipe: %s", default_renderer_config
+        )
+        if not check_render_pipe_str(
+            default_renderer_config,
+            rend,
+            opts["renderer_blacklist"],
+            opts["renderer_whitelist"],
+        ):
+            raise LoaderError(err)
     return rend
 
 
@@ -1065,7 +1068,11 @@ def _load_cached_grains(opts, cfn):
             return None
 
         return _format_cached_grains(cached_grains)
-    except OSError:
+    except (OSError, SaltDeserializationError):
+        log.debug(
+            "Grains cache was not readable or did not deserialize and might be corrupted. Refreshing.",
+            exc_info=True,
+        )
         return None
 
 
@@ -1187,7 +1194,8 @@ def grains(opts, force_refresh=False, proxy=None, context=None, loaded_base_name
         except Exception:  # pylint: disable=broad-except
             if salt.utils.platform.is_proxy():
                 log.info(
-                    "The following CRITICAL message may not be an error; the proxy may not be completely established yet."
+                    "The following CRITICAL message may not be an error; "
+                    "the proxy may not be completely established yet."
                 )
             log.critical(
                 "Failed to load grains defined in grain file %s in "
@@ -1264,6 +1272,10 @@ def grains(opts, force_refresh=False, proxy=None, context=None, loaded_base_name
         salt.utils.dictupdate.update(grains_data, opts["grains"])
     else:
         grains_data.update(opts["grains"])
+
+    # Clean up loaded grains modules from sys.modules to free memory
+    funcs.clean_modules()
+
     return salt.utils.data.decode(grains_data, preserve_tuples=True)
 
 

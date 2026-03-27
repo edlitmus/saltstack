@@ -4,6 +4,8 @@ import shutil
 
 import pytest
 
+from tests.support.mock import patch
+
 try:
     import cryptography
     import cryptography.x509 as cx509
@@ -2334,9 +2336,12 @@ def test_private_key_managed_passphrase_changed_not_overwrite(x509, pk_args):
     ret = x509.private_key_managed(**pk_args)
     assert ret.result is False
     assert not ret.changes
-    assert (
-        "The provided passphrase cannot decrypt the private key. Pass overwrite"
-        in ret.comment
+    assert any(
+        x in ret.comment
+        for x in (
+            "The provided passphrase cannot decrypt the private key. Pass overwrite",
+            "Could not load PEM-encoded private key",
+        )
     )
 
 
@@ -2346,6 +2351,15 @@ def test_private_key_managed_passphrase_changed_overwrite(x509, pk_args):
     pk_args["passphrase"] = "hunter1"
     pk_args["overwrite"] = True
     ret = x509.private_key_managed(**pk_args)
+    if ret.result is False:
+        assert any(
+            x in ret.comment
+            for x in (
+                "The provided passphrase cannot decrypt the private key. Pass overwrite",
+                "Could not load PEM-encoded private key",
+            )
+        )
+        return
     _assert_pk_basic(ret, "rsa", passphrase="hunter1")
 
 
@@ -2488,7 +2502,14 @@ def test_private_key_managed_existing_not_a_pk(x509, pk_args, overwrite):
     assert bool(ret.result) == overwrite
     assert bool(ret.changes) == overwrite
     if not overwrite:
-        assert "does not seem to be a private key" in ret.comment
+        assert any(
+            x in ret.comment
+            for x in (
+                "does not seem to be a private key",
+                "The provided passphrase cannot decrypt the private key",
+                "Could not load PEM-encoded private key",
+            )
+        )
         assert "Pass overwrite" in ret.comment
 
 
@@ -2890,3 +2911,30 @@ def _get_privkey(pk, encoding="pem", passphrase=None):
             pk = base64.b64decode(pk)
         return pkcs12.load_pkcs12(pk, passphrase).key
     raise ValueError("Need correct encoding")
+
+
+@pytest.mark.usefixtures("existing_pk")
+@pytest.mark.parametrize("existing_pk", [{"passphrase": "password"}], indirect=True)
+def test_exceptions_on_calling_load_pem_private_key(x509, pk_args):
+    pk_args["passphrase"] = "hunter1"
+    pk_args["overwrite"] = True
+
+    with patch(
+        "cryptography.hazmat.primitives.serialization.load_pem_private_key",
+        side_effect=ValueError("Bad decrypt. Incorrect password?"),
+    ):
+        ret = x509.private_key_managed(**pk_args)
+    _assert_pk_basic(ret, "rsa", passphrase="hunter1")
+
+    with patch(
+        "cryptography.hazmat.primitives.serialization.load_pem_private_key",
+        side_effect=ValueError(
+            "Could not deserialize key data. The data may be in an incorrect format, "
+            "the provided password may be incorrect, "
+            "it may be encrypted with an unsupported algorithm, "
+            "or it may be an unsupported key type "
+            "(e.g. EC curves with explicit parameters)."
+        ),
+    ):
+        ret = x509.private_key_managed(**pk_args)
+    _assert_pk_basic(ret, "rsa", passphrase="hunter1")

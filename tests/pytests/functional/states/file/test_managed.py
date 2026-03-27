@@ -11,6 +11,7 @@ import pytest
 
 import salt.utils.files
 import salt.utils.platform
+from salt.modules.gpg import _homedir_fix
 
 try:
     import gnupg as gnupglib
@@ -86,7 +87,9 @@ def gpghome(tmp_path):
 
 @pytest.fixture
 def gnupg(gpghome):
-    return gnupglib.GPG(gnupghome=str(gpghome))
+    gpg = gnupglib.GPG(gnupghome=str(gpghome))
+    gpg.gnupghome = _homedir_fix(gpghome)
+    return gpg
 
 
 @pytest.fixture
@@ -904,6 +907,7 @@ def test_file_managed_keep_source_false_http(
 
 
 @pytest.mark.parametrize("verify_ssl", [True, False])
+@pytest.mark.flaky(max_runs=4)
 def test_verify_ssl_https_source(file, tmp_path, ssl_webserver, verify_ssl):
     """
     test verify_ssl when its False and True when managing

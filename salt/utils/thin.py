@@ -20,12 +20,20 @@ import types
 import zipfile
 
 import distro
+import idna
 import jinja2
 import looseversion
 import msgpack
-import networkx
 import packaging
+import requests
 import tornado
+import urllib3
+
+try:
+    import charset_normalizer
+except ImportError:
+    charset_normalizer = None
+
 import yaml
 
 import salt
@@ -91,8 +99,13 @@ except ImportError:
     except ImportError:
         ssl_match_hostname = None
 
-concurrent = None
+try:
+    import backports
+except ImportError:
+    # Python 3.13+ doesn't have backports package
+    backports = None
 
+import concurrent.futures as concurrent
 
 log = logging.getLogger(__name__)
 
@@ -281,7 +294,10 @@ def get_tops_python(py_ver, exclude=None, ext_py_ver=None):
         "yaml",
         "tornado",
         "msgpack",
-        "networkx",
+        "requests",
+        "idna",
+        "urllib3",
+        "charset_normalizer",
         "certifi",
         "singledispatch",
         "concurrent",
@@ -292,6 +308,9 @@ def get_tops_python(py_ver, exclude=None, ext_py_ver=None):
         "looseversion",
         "packaging",
     ]
+    # backports package doesn't exist in Python 3.13+
+    if sys.version_info < (3, 13):
+        mods.append("backports")
     if ext_py_ver and tuple(ext_py_ver) >= (3, 0):
         mods.append("distro")
 
@@ -332,7 +351,7 @@ def get_ext_tops(config):
     """
     config = copy.deepcopy(config) or {}
     alternatives = {}
-    required = ["jinja2", "yaml", "tornado", "msgpack", "networkx"]
+    required = ["jinja2", "yaml", "tornado", "msgpack"]
     tops = []
     for ns, cfg in config.items():
         alternatives[ns] = cfg
@@ -431,7 +450,6 @@ def get_tops(extra_mods="", so_mods=""):
         yaml,
         tornado,
         msgpack,
-        networkx,
         certifi,
         singledispatch,
         concurrent,
@@ -441,6 +459,11 @@ def get_tops(extra_mods="", so_mods=""):
         backports_abc,
         looseversion,
         packaging,
+        backports,
+        requests,
+        idna,
+        urllib3,
+        charset_normalizer,
     ]
     modules = find_site_modules("contextvars")
     if modules:
@@ -459,8 +482,7 @@ def get_tops(extra_mods="", so_mods=""):
     for mod in [m for m in extra_mods.split(",") if m]:
         if mod not in locals() and mod not in globals():
             try:
-                locals()[mod] = __import__(mod)
-                moddir, modname = os.path.split(locals()[mod].__file__)
+                moddir, modname = os.path.split(__import__(mod).__file__)
                 base, _ = os.path.splitext(modname)
                 if base == "__init__":
                     tops.append((moddir, None))
@@ -473,8 +495,7 @@ def get_tops(extra_mods="", so_mods=""):
 
     for mod in [m for m in so_mods.split(",") if m]:
         try:
-            locals()[mod] = __import__(mod)
-            tops.append((locals()[mod].__file__, None))
+            tops.append((__import__(mod).__file__, None))
         except ImportError:
             log.error('Unable to import so-module "%s"', mod, exc_info=True)
 
@@ -625,11 +646,12 @@ def _get_package_root_mod(mod):
     while level < len(parts):
         root_mod_name = ".".join(parts[: level + 1])
         root_mod = sys.modules[root_mod_name]
-        # importlib.machinery.NamespaceLoader requires Python 3.11+
-        if type(root_mod.__path__) is list:
+        # Namespace packages don't have __file__ (or it's None)
+        if getattr(root_mod, "__file__", None):
             return root_mod, tuple(parts[:level])
         level += 1
-    raise RuntimeError(f"Unable to determine package root mod for {mod}")
+    # If we reached here, it's a namespace package
+    return sys.modules[parts[0]], ()
 
 
 def _discover_saltexts(allowlist=None, blocklist=None):
@@ -638,18 +660,32 @@ def _discover_saltexts(allowlist=None, blocklist=None):
     blocklist = blocklist or []
 
     for entry_point in salt.utils.entrypoints.iter_entry_points("salt.loader"):
-        if allowlist is not None and entry_point.dist.name not in allowlist:
+        try:
+            # We could get this via entry_point.dist._path.name, but that is hacky
+            dist_name = next(
+                iter(
+                    file.parent.name
+                    for file in entry_point.dist.files or []
+                    if file.parent.suffix == ".dist-info"
+                )
+            )
+        except StopIteration:
+            # This can happen if dist.files is None (e.g. editable install)
+            # Fallback to dist.name
+            dist_name = entry_point.dist.name
+
+        if allowlist is not None and dist_name not in allowlist:
             log.debug(
                 "Skipping entry point '%s' of '%s': not in allowlist",
                 entry_point.name,
-                entry_point.dist.name,
+                dist_name,
             )
             continue
-        if entry_point.dist.name in blocklist:
+        if dist_name in blocklist:
             log.debug(
                 "Skipping entry point '%s' of '%s': in blocklist",
                 entry_point.name,
-                entry_point.dist.name,
+                dist_name,
             )
             continue
         with _catch_entry_points_exception(entry_point) as ctx:
@@ -660,27 +696,10 @@ def _discover_saltexts(allowlist=None, blocklist=None):
             log.debug(
                 "Skipping entry point '%s' of '%s': Not a function/module",
                 entry_point.name,
-                entry_point.dist.name,
+                dist_name,
             )
             continue
         if entry_point.dist.name not in loaded_saltexts:
-            try:
-                # We could get this via entry_point.dist._path.name, but that is hacky
-                dist_name = next(
-                    iter(
-                        file.parent.name
-                        for file in entry_point.dist.files
-                        if file.parent.suffix == ".dist-info"
-                    )
-                )
-            except StopIteration:
-                # This should never happen since we have the data to arrive here
-                log.debug(
-                    "Skipping entry point '%s' of '%s': Failed discovering dist-info",
-                    entry_point.name,
-                    entry_point.dist.name,
-                )
-                continue
             loaded_saltexts[entry_point.dist.name] = {
                 "name": dist_name,
                 "entrypoints": {},
@@ -718,9 +737,12 @@ def _pack_saltext_dists(saltext_dists, digest_collector, tfp):
             + "\n".join(f"{name} = {val}" for name, val in data["entrypoints"].items())
             + "\n"
         ).encode("utf-8")
-        info = tarfile.TarInfo(name="py3/" + data["name"] + "/entry_points.txt")
-        info.size = len(defs)
-        tfp.addfile(tarinfo=info, fileobj=io.BytesIO(defs))
+        # Ensure it's in the correct directory for the distribution
+        # Some loaders might expect hyphens, others underscores
+        for name in [data["name"], data["name"].replace("-", "_")]:
+            info = tarfile.TarInfo(name="py3/" + name + ".dist-info/entry_points.txt")
+            info.size = len(defs)
+            tfp.addfile(tarinfo=info, fileobj=io.BytesIO(defs))
         digest_collector.add_data(defs)
 
 

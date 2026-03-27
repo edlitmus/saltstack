@@ -4,6 +4,7 @@ import os
 import pathlib
 import pprint
 import shutil
+import subprocess
 import sys
 
 import pytest
@@ -64,6 +65,18 @@ def create_virtualenv(modules):
         Also, one windows, we must also point to the virtualenv binary outside the existing
         virtualenv because it will fail otherwise
         """
+        if "venv_bin" not in kwargs:
+            # Try to find the onedir virtualenv first
+            onedir_venv = os.path.join(
+                os.environ.get("REPO_ROOT_DIR", "/salt"),
+                "artifacts",
+                "salt",
+                "bin",
+                "virtualenv",
+            )
+            if os.path.exists(onedir_venv):
+                kwargs["venv_bin"] = onedir_venv
+
         if "python" not in kwargs:
             try:
                 if salt.utils.platform.is_windows():
@@ -81,12 +94,9 @@ def create_virtualenv(modules):
                         if os.path.exists(python):
                             break
                     else:
-                        pytest.fail(
-                            "Couldn't find a python binary name under '{}' matching: {}".format(
-                                os.path.join(sys.real_prefix, "bin"),
-                                python_binary_names,
-                            )
-                        )
+                        # Fallback to system python if we can't find the real prefix one
+                        python = sys.executable
+
                 # We're running off a virtualenv, and we don't want to create a virtualenv off of
                 # a virtualenv, let's point to the actual python that created the virtualenv
                 kwargs["python"] = python
@@ -106,6 +116,10 @@ def _skip_if_pep8_installed(modules, pkg_name):
 
 @pytest.mark.slow_test
 @pytest.mark.usefixtures("_skip_if_pep8_installed")
+@pytest.mark.skipif(
+    bool(salt.utils.path.which("transactional-update")),
+    reason="Skipping on transactional systems",
+)
 def test_pip_installed_removed(states, pkg_name):
     """
     Tests installed and removed states
@@ -117,6 +131,7 @@ def test_pip_installed_removed(states, pkg_name):
 
 
 @pytest.mark.slow_test
+@pytest.mark.skip_if_binaries_missing("virtualenv", reason="Needs virtualenv binary")
 def test_pip_installed_removed_venv(states, venv, pkg_name):
     ret = states.pip.installed(name=pkg_name, bin_env=str(venv.venv_dir))
     assert ret.result is True
@@ -125,6 +140,7 @@ def test_pip_installed_removed_venv(states, venv, pkg_name):
 
 
 @pytest.mark.slow_test
+@pytest.mark.skip_if_binaries_missing("virtualenv", reason="Needs virtualenv binary")
 def test_pip_installed_errors(tmp_path, modules, state_tree):
     venv_dir = tmp_path / "pip-installed-errors"
     # Since we don't have the virtualenv created, pip.installed will
@@ -156,6 +172,7 @@ def test_pip_installed_errors(tmp_path, modules, state_tree):
                     assert state_return.result is True
 
 
+@pytest.mark.skip_if_binaries_missing("virtualenv", reason="Needs virtualenv binary")
 def test_pip_installed_name_test_mode(states, venv, pkg_name):
     """
     Test pip.installed state while test=true
@@ -164,6 +181,7 @@ def test_pip_installed_name_test_mode(states, venv, pkg_name):
     assert pkg_name in ret.comment
 
 
+@pytest.mark.skip_if_binaries_missing("virtualenv", reason="Needs virtualenv binary")
 def test_pip_installed_pkgs_test_mode(states, venv):
     """
     Test pip.installed state while test=true
@@ -177,6 +195,7 @@ def test_pip_installed_pkgs_test_mode(states, venv):
 
 
 @pytest.mark.slow_test
+@pytest.mark.skip_if_binaries_missing("virtualenv", reason="Needs virtualenv binary")
 def test_issue_2028_pip_installed_state(
     tmp_path, modules, state_tree, get_python_executable
 ):
@@ -234,6 +253,7 @@ def test_issue_2028_pip_installed_state(
 
 
 @pytest.mark.slow_test
+@pytest.mark.skip_if_binaries_missing("virtualenv", reason="Needs virtualenv binary")
 def test_issue_2087_missing_pip(modules, venv, pkg_name, state_tree):
     sls_name = "issue-2087-missing-pip"
     sls_contents = f"""
@@ -276,6 +296,7 @@ def test_issue_2087_missing_pip(modules, venv, pkg_name, state_tree):
 @pytest.mark.destructive_test
 @pytest.mark.slow_test
 @pytest.mark.skip_if_not_root
+@pytest.mark.skip_if_binaries_missing("virtualenv", reason="Needs virtualenv binary")
 def test_issue_6912_wrong_owner(tmp_path, create_virtualenv, states, account):
     # Setup virtual environment directory to be used throughout the test
     venv_dir = tmp_path / "6912-wrong-owner"
@@ -333,6 +354,7 @@ def test_issue_6912_wrong_owner(tmp_path, create_virtualenv, states, account):
 @pytest.mark.skip_on_darwin(reason="Test is flaky on macosx")
 @pytest.mark.slow_test
 @pytest.mark.skip_if_not_root
+@pytest.mark.skip_if_binaries_missing("virtualenv", reason="Needs virtualenv binary")
 def test_issue_6912_wrong_owner_requirements_file(
     tmp_path, create_virtualenv, state_tree, states, account
 ):
@@ -394,6 +416,8 @@ def test_issue_6912_wrong_owner_requirements_file(
 
 @pytest.mark.destructive_test
 @pytest.mark.slow_test
+@pytest.mark.skip_if_binaries_missing("virtualenv", reason="Needs virtualenv binary")
+@pytest.mark.requires_network
 def test_issue_6833_pip_upgrade_pip(tmp_path, create_virtualenv, modules, states):
     # Create the testing virtualenv
     if sys.platform == "win32":
@@ -420,36 +444,49 @@ def test_issue_6833_pip_upgrade_pip(tmp_path, create_virtualenv, modules, states
             pprint.pformat(ret)
         )
 
-    # Let's install a fixed version pip over whatever pip was
-    # previously installed
-    ret = modules.pip.install("pip==19.3.1", upgrade=True, bin_env=venv_dir)
+    # Download wheels to avoid PyPI slowness/timeouts during test
+    wheels_dir = tmp_path / "wheels"
+    wheels_dir.mkdir()
 
-    if not isinstance(ret, dict):
-        pytest.fail(
-            "The 'pip.install' command did not return the excepted dictionary."
-            " Output:\n{}".format(ret)
-        )
+    pip_22_0_4_url = "https://files.pythonhosted.org/packages/4d/16/0a14ca596f30316efd412a60bdfac02a7259bf8673d4d917dc60b9a21812/pip-22.0.4-py3-none-any.whl"
+    pip_22_1_2_url = "https://files.pythonhosted.org/packages/96/2f/caec18213f6a67852f6997fb0673ae08d2e93d1b81573edb93ba4ef06970/pip-22.1.2-py3-none-any.whl"
 
-    assert ret["retcode"] == 0
-    assert "Successfully installed pip" in ret["stdout"]
+    for url in (pip_22_0_4_url, pip_22_1_2_url):
+        subprocess.check_call(["curl", "-L", "-O", url], cwd=str(wheels_dir))
 
-    # Let's make sure we have pip 9.0.1 installed
-    assert modules.pip.list("pip", bin_env=venv_dir) == {"pip": "19.3.1"}
+    # Use local wheels
+    with patched_environ(PIP_NO_INDEX="1", PIP_FIND_LINKS=str(wheels_dir)):
+        # Let's install a fixed version pip over whatever pip was
+        # previously installed
+        ret = modules.pip.install("pip==22.0.4", upgrade=True, bin_env=venv_dir)
 
-    # Now the actual pip upgrade pip test
-    ret = states.pip.installed(name="pip==20.0.1", upgrade=True, bin_env=venv_dir)
+        if not isinstance(ret, dict):
+            pytest.fail(
+                "The 'pip.install' command did not return the excepted dictionary."
+                " Output:\n{}".format(ret)
+            )
 
-    if not isinstance(ret.raw, dict):
-        pytest.fail(
-            "The 'pip.install' command did not return the excepted dictionary."
-            " Output:\n{}".format(ret)
-        )
+        assert ret["retcode"] == 0
+        assert "Successfully installed pip" in ret["stdout"]
 
-    assert ret.result is True
-    assert ret.changes == {"pip==20.0.1": "Installed"}
+        # Let's make sure we have pip 22.0.4 installed
+        assert modules.pip.list("pip", bin_env=venv_dir) == {"pip": "22.0.4"}
+
+        # Now the actual pip upgrade pip test
+        ret = states.pip.installed(name="pip==22.1.2", upgrade=True, bin_env=venv_dir)
+
+        if not isinstance(ret.raw, dict):
+            pytest.fail(
+                "The 'pip.install' command did not return the excepted dictionary."
+                " Output:\n{}".format(ret)
+            )
+
+        assert ret.result is True
+        assert ret.changes == {"pip==22.1.2": "Installed"}
 
 
 @pytest.mark.slow_test
+@pytest.mark.skip_if_binaries_missing("virtualenv", reason="Needs virtualenv binary")
 def test_pip_installed_specific_env(state_tree_prod, states, venv):
     contents = "pep8\n"
 
@@ -492,6 +529,7 @@ def test_pip_installed_specific_env(state_tree_prod, states, venv):
 
 
 @pytest.mark.slow_test
+@pytest.mark.skip_if_binaries_missing("virtualenv", reason="Needs virtualenv binary")
 def test_22359_pip_installed_unless_does_not_trigger_warnings(states, venv):
     # This test case should be moved to a format_call unit test specific to
     # the state internal keywords

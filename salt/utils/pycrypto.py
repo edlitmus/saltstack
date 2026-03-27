@@ -24,9 +24,12 @@ except ImportError:
     HAS_RANDOM = False
 
 try:
-    import crypt
+    import crypt  # pylint: disable=deprecated-module
 
-    HAS_CRYPT = True
+    # We need to ensure if the right `crypt` is loaded,
+    # as LazyLoader can load `salt.utils.crypt` instead of `crypt`
+    # if there is Python has no `crypt` (was removed in 3.11).
+    HAS_CRYPT = hasattr(crypt, "methods")
 except (ImportError, PermissionError):
     HAS_CRYPT = False
 

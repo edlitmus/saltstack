@@ -940,6 +940,18 @@ class DaemonMixIn(metaclass=MixInMeta):
             default=os.path.join(syspaths.PIDFILE_DIR, f"{self.get_prog_name()}.pid"),
             help="Specify the location of the pidfile. Default: '%default'.",
         )
+        self.add_option(
+            "--disable-keepalive",
+            dest="disable_keepalive",
+            default=False,
+            action="store_true",
+            help=(
+                "Disable the automatic restart mechanism. By default, the daemon "
+                "runs in a subprocess with automatic restart capabilities. This "
+                "option disables that behavior and runs the daemon directly. "
+                "Useful when an external process manager like systemd handles restarts."
+            ),
+        )
 
     def _mixin_before_exit(self):
         if hasattr(self, "config") and self.config.get("pidfile"):
@@ -2855,16 +2867,19 @@ class SaltCallOptionParser(
         self.add_option(
             "--file-root",
             default=None,
+            action="append",
             help="Set this directory as the base file root.",
         )
         self.add_option(
             "--pillar-root",
             default=None,
+            action="append",
             help="Set this directory as the base pillar root.",
         )
         self.add_option(
             "--states-dir",
             default=None,
+            action="append",
             help="Set this directory to search for additional states.",
         )
         self.add_option(
@@ -3269,6 +3284,25 @@ class SaltSSHOptionParser(
                 "forwarding definitions will be translated into multiple "
                 "-R parameters."
             ),
+        )
+        ssh_group.add_option(
+            "--disable-keepalive",
+            default=True,
+            action="store_false",
+            dest="ssh_keepalive",
+            help=(
+                "Disable KeepAlive probes (ServerAliveInterval) for the SSH connection."
+            ),
+        )
+        ssh_group.add_option(
+            "--keepalive-interval",
+            dest="ssh_keepalive_interval",
+            help=("Define the value for ServerAliveInterval option."),
+        )
+        ssh_group.add_option(
+            "--keepalive-count-max",
+            dest="ssh_keepalive_count_max",
+            help=("Define the value for ServerAliveCountMax option."),
         )
         ssh_group.add_option(
             "--ssh-option",

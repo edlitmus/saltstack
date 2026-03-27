@@ -20,15 +20,14 @@ import importlib
 import inspect
 import logging
 import os
+import pickle
 import random
 import re
 import site
 import time
 import traceback
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
-from typing import Any, Optional, Union
-
-import networkx as nx
+from typing import Any, Union
 
 import salt.channel.client
 import salt.fileclient
@@ -45,6 +44,7 @@ import salt.utils.event
 import salt.utils.files
 import salt.utils.hashutils
 import salt.utils.immutabletypes as immutabletypes
+import salt.utils.jid
 import salt.utils.msgpack
 import salt.utils.platform
 import salt.utils.process
@@ -57,8 +57,8 @@ from salt.exceptions import CommandExecutionError, SaltRenderError, SaltReqTimeo
 from salt.serializers.msgpack import deserialize as msgpack_deserialize
 from salt.serializers.msgpack import serialize as msgpack_serialize
 from salt.template import compile_template, compile_template_str
-from salt.utils.odict import DefaultOrderedDict, OrderedDict
-from salt.utils.requisite import DependencyGraph, RequisiteType
+from salt.utils.datastructures import DefaultOrderedDict, HashableOrderedDict
+from salt.utils.requisite import DependencyGraph, DiGraphCycle, RequisiteType
 
 log = logging.getLogger(__name__)
 
@@ -131,11 +131,6 @@ STATE_INTERNAL_KEYWORDS = STATE_REQUISITE_KEYWORDS.union(
 ).union(STATE_RUNTIME_KEYWORDS)
 
 
-class HashableOrderedDict(OrderedDict):
-    def __hash__(self) -> int:
-        return id(self)
-
-
 def split_low_tag(tag: str) -> dict[str, Any]:
     """
     Take a low tag and split it back into the low dict that it came from
@@ -167,11 +162,9 @@ def _calculate_fake_duration() -> tuple[str, float]:
     Generate a NULL duration for when states do not run
     but we want the results to be consistent.
     """
-    utc_start_time = datetime.datetime.utcnow()
-    local_start_time = utc_start_time - (
-        datetime.datetime.utcnow() - datetime.datetime.now()
-    )
-    utc_finish_time = datetime.datetime.utcnow()
+    utc_start_time = datetime.datetime.now(tz=datetime.timezone.utc)
+    local_start_time = utc_start_time.astimezone()
+    utc_finish_time = datetime.datetime.now(tz=datetime.timezone.utc)
     start_time = local_start_time.time().isoformat()
     delta = utc_finish_time - utc_start_time
     # duration in milliseconds.microseconds
@@ -628,7 +621,7 @@ class Compiler:
         try:
             # Get nodes in topological order also sorted by order attribute
             sorted_chunks = self.dependency_dag.aggregate_and_order_chunks(cap)
-        except nx.NetworkXUnfeasible:
+        except DiGraphCycle:
             sorted_chunks = []
             cycle_edges = self.dependency_dag.get_cycles_str()
             errors.append(f"Recursive requisites were found: {cycle_edges}")
@@ -708,6 +701,106 @@ class Compiler:
         return _apply_exclude(high)
 
 
+class ParallelState:
+    """
+    Utility class that wraps parallel state instantiation.
+    Intentionally not picklable since performing the check for picklability
+    of inject_globals, specifically the context dict, would need to happen
+    eagerly for that guarantee to hold.
+    """
+
+    name: str
+    parent: State
+    cdata: dict[str, Any]
+    low: LowChunk
+    inject_globals: dict[Any, Any] | None
+    proc: salt.utils.Process | None
+
+    def __init__(
+        self,
+        parent: State,
+        cdata: dict[str, Any],
+        low: LowChunk,
+        inject_globals: dict[Any, Any] | None,
+    ):
+        # There are a number of possibilities to not have the cdata
+        # populated with what we might have expected, so just be smart
+        # enough to not raise another KeyError as the name is easily
+        # guessable and fallback in all cases to present the real
+        # exception to the user
+        name = (cdata.get("args") or [None])[0] or cdata["kwargs"].get("name")
+        if not name:
+            name = low.get("name", low.get("__id__"))
+        self.name = name
+        self.tag = _gen_tag(low)
+        self.parent = parent
+        self.cdata = cdata
+        self.low = low
+        self.inject_globals = inject_globals
+        self.proc = None
+
+    def __bool__(self):
+        return self.proc is not None and self.proc.is_alive()
+
+    def start(self):
+        if self.proc is not None:
+            raise RuntimeError("Parallel state is already running")
+
+        inject_globals = self.inject_globals
+        if salt.utils.platform.spawning_platform():
+            instance = None
+        else:
+            instance = self.parent
+            inject_globals = None
+
+        proc = salt.utils.process.Process(
+            target=self.parent._call_parallel_target,
+            args=(
+                instance,
+                self.parent._init_kwargs,
+                self.name,
+                self.cdata,
+                self.low,
+                inject_globals,
+            ),
+            name=f"ParallelState({self.name})",
+        )
+
+        try:
+            proc.start()
+        except TypeError as err:
+            # Some modules use the context to cache unpicklable objects like
+            # database connections or loader instances.
+            # Ensure we don't crash because of that on spawning platforms.
+            if "cannot pickle" not in str(err):
+                raise
+            clean_context = {}
+            for var, val in self.parent._init_kwargs.get("context", {}).items():
+                try:
+                    pickle.dumps(val)
+                except TypeError:
+                    pass
+                else:
+                    clean_context[var] = val
+            init_kwargs = self.parent._init_kwargs.copy()
+            init_kwargs["context"] = clean_context
+            proc = salt.utils.process.Process(
+                target=self.parent._call_parallel_target,
+                args=(
+                    instance,
+                    init_kwargs,
+                    self.name,
+                    self.cdata,
+                    self.low,
+                    inject_globals,
+                ),
+                name=f"ParallelState({self.name})",
+            )
+            proc.start()
+
+        self.proc = proc
+
+
 class State:
     """
     Class used to execute salt states
@@ -725,7 +818,21 @@ class State:
         loader="states",
         initial_pillar=None,
         file_client=None,
+        _invocation_id=None,
     ):
+        """
+        When instantiating an object of this class, do not pass
+        ``_invocation_id``. It is an internal field for tracking
+        parallel executions where no jid is available (Salt-SSH) and
+        only exposed as an init argument to work on spawning platforms.
+        """
+        if jid is not None:
+            _invocation_id = jid
+        if _invocation_id is None:
+            # For salt-ssh parallel states, we need a unique identifier
+            # for a single execution. self.jid should not be set there
+            # since it's used for other purposes as well.
+            _invocation_id = salt.utils.jid.gen_jid(opts)
         self._init_kwargs = {
             "opts": opts,
             "pillar_override": pillar_override,
@@ -736,6 +843,7 @@ class State:
             "mocked": mocked,
             "loader": loader,
             "initial_pillar": initial_pillar,
+            "_invocation_id": _invocation_id,
         }
         self.states_loader = loader
         if "grains" not in opts:
@@ -781,13 +889,18 @@ class State:
         self.pre = {}
         self.__run_num = 0
         self.jid = jid
+        self.invocation_id = _invocation_id
         self.instance_id = str(id(self))
         self.inject_globals = {}
         self.mocked = mocked
         self.global_state_conditions = None
         self.dependency_dag = DependencyGraph()
         # a mapping of state tag (unique id) to the return result dict
-        self.disabled_states: Optional[dict[str, dict[str, Any]]] = None
+        self.disabled_states: dict[str, dict[str, Any]] | None = None
+        # Keep track of running/scheduled parallel state runs. We need to keep those out of the
+        # running dict because the ParallelState objects, which filter unpicklable objects
+        # out of the context dict when necessary, are not picklable themselves.
+        self.procs = {}
 
     def _match_global_state_conditions(self, full, state, name):
         """
@@ -1146,6 +1259,8 @@ class State:
         cmd_opts = {}
         if "shell" in self.opts["grains"]:
             cmd_opts["shell"] = self.opts["grains"].get("shell")
+        if isinstance(low["check_cmd"], str):
+            low["check_cmd"] = [low["check_cmd"]]
         for entry in low["check_cmd"]:
             cmd = self.functions["cmd.retcode"](
                 entry, ignore_retcode=True, python_shell=True, **cmd_opts
@@ -1423,7 +1538,7 @@ class State:
         try:
             # Get nodes in topological order also sorted by order attribute
             sorted_chunks = self.dependency_dag.aggregate_and_order_chunks(cap)
-        except nx.NetworkXUnfeasible:
+        except DiGraphCycle:
             sorted_chunks = []
             cycle_edges = self.dependency_dag.get_cycles_str()
             errors.append(f"Recursive requisites were found: {cycle_edges}")
@@ -1445,7 +1560,7 @@ class State:
                 )
 
     def compile_high_data(
-        self, high: dict[str, Any], orchestration_jid: Union[str, int, None] = None
+        self, high: dict[str, Any], orchestration_jid: str | int | None = None
     ) -> tuple[list[LowChunk], list[str]]:
         """
         "Compile" the high data as it is retrieved from the CLI or YAML into
@@ -1892,15 +2007,18 @@ class State:
         return req_in_high, errors
 
     @classmethod
-    def _call_parallel_target(cls, instance, init_kwargs, name, cdata, low):
+    def _call_parallel_target(
+        cls, instance, init_kwargs, name, cdata, low, inject_globals
+    ):
         """
         The target function to call that will create the parallel thread/process
         """
         if instance is None:
             instance = cls(**init_kwargs)
+            instance.states.inject_globals = inject_globals
         # we need to re-record start/end duration here because it is impossible to
         # correctly calculate further down the chain
-        utc_start_time = datetime.datetime.utcnow()
+        utc_start_time = datetime.datetime.now(tz=datetime.timezone.utc)
 
         instance.format_slots(cdata)
         tag = _gen_tag(low)
@@ -1920,10 +2038,9 @@ class State:
                 "comment": f"An exception occurred in this state: {trb}",
             }
 
-        utc_finish_time = datetime.datetime.utcnow()
-        timezone_delta = datetime.datetime.utcnow() - datetime.datetime.now()
-        local_finish_time = utc_finish_time - timezone_delta
-        local_start_time = utc_start_time - timezone_delta
+        utc_finish_time = datetime.datetime.now(tz=datetime.timezone.utc)
+        local_finish_time = utc_finish_time.astimezone()
+        local_start_time = utc_start_time.astimezone()
         ret["start_time"] = local_start_time.time().isoformat()
         delta = utc_finish_time - utc_start_time
         # duration in milliseconds.microseconds
@@ -1953,8 +2070,8 @@ class State:
                         *cdata["args"], **cdata["kwargs"]
                     )
 
-                    utc_start_time = datetime.datetime.utcnow()
-                    utc_finish_time = datetime.datetime.utcnow()
+                    utc_start_time = datetime.datetime.now(tz=datetime.timezone.utc)
+                    utc_finish_time = datetime.datetime.now(tz=datetime.timezone.utc)
                     delta = utc_finish_time - utc_start_time
                     duration = (delta.seconds * 1000000 + delta.microseconds) / 1000.0
                     retry_ret["duration"] = duration
@@ -1990,7 +2107,7 @@ class State:
                     ]
                 )
 
-        troot = os.path.join(instance.opts["cachedir"], instance.jid)
+        troot = os.path.join(instance.opts["cachedir"], instance.invocation_id)
         tfile = os.path.join(troot, salt.utils.hashutils.sha1_digest(tag))
         if not os.path.isdir(troot):
             try:
@@ -2002,36 +2119,28 @@ class State:
         with salt.utils.files.fopen(tfile, "wb+") as fp_:
             fp_.write(msgpack_serialize(ret))
 
-    def call_parallel(self, cdata: dict[str, Any], low: LowChunk):
+    def call_parallel(
+        self,
+        cdata: dict[str, Any],
+        low: LowChunk,
+        inject_globals: dict[Any, Any] | None,
+    ):
         """
         Call the state defined in the given cdata in parallel
         """
-        # There are a number of possibilities to not have the cdata
-        # populated with what we might have expected, so just be smart
-        # enough to not raise another KeyError as the name is easily
-        # guessable and fallback in all cases to present the real
-        # exception to the user
-        name = (cdata.get("args") or [None])[0] or cdata["kwargs"].get("name")
-        if not name:
-            name = low.get("name", low.get("__id__"))
+        parallel = ParallelState(self, cdata, low, inject_globals)
+        self.procs[parallel.tag] = parallel
 
-        if salt.utils.platform.spawning_platform():
-            instance = None
+        if self.check_max_parallel():
+            parallel.start()
+            comment = "Started in a separate process"
         else:
-            instance = self
-
-        proc = salt.utils.process.Process(
-            target=self._call_parallel_target,
-            args=(instance, self._init_kwargs, name, cdata, low),
-            name=f"ParallelState({name})",
-        )
-        proc.start()
+            comment = "Waiting to be started in a separate process, max_parallel hit"
         ret = {
-            "name": name,
+            "name": parallel.name,
             "result": None,
             "changes": {},
-            "comment": "Started in a separate process",
-            "proc": proc,
+            "comment": comment,
         }
         return ret
 
@@ -2039,18 +2148,16 @@ class State:
     def call(
         self,
         low: LowChunk,
-        chunks: Optional[Sequence[LowChunk]] = None,
-        running: Optional[dict[str, dict]] = None,
+        chunks: Sequence[LowChunk] | None = None,
+        running: dict[str, dict] | None = None,
         retries: int = 1,
     ):
         """
         Call a state directly with the low data structure, verify data
         before processing.
         """
-        utc_start_time = datetime.datetime.utcnow()
-        local_start_time = utc_start_time - (
-            datetime.datetime.utcnow() - datetime.datetime.now()
-        )
+        utc_start_time = datetime.datetime.now(tz=datetime.timezone.utc)
+        local_start_time = utc_start_time.astimezone()
         low_name = low.get("name")
         log_low_name = low_name.strip() if isinstance(low_name, str) else low_name
         log.info(
@@ -2177,7 +2284,11 @@ class State:
                         )
                     elif not low.get("__prereq__") and low.get("parallel"):
                         # run the state call in parallel, but only if not in a prereq
-                        ret = self.call_parallel(cdata, low)
+                        ret = self.call_parallel(
+                            cdata,
+                            low,
+                            inject_globals,
+                        )
                     else:
                         self.format_slots(cdata)
                         with salt.utils.files.set_umask(low.get("__umask__")):
@@ -2241,10 +2352,9 @@ class State:
         self.__run_num += 1
         format_log(ret)
         self.check_refresh(low, ret)
-        utc_finish_time = datetime.datetime.utcnow()
-        timezone_delta = datetime.datetime.utcnow() - datetime.datetime.now()
-        local_finish_time = utc_finish_time - timezone_delta
-        local_start_time = utc_start_time - timezone_delta
+        utc_finish_time = datetime.datetime.now(tz=datetime.timezone.utc)
+        local_finish_time = utc_finish_time.astimezone()
+        local_start_time = utc_start_time.astimezone()
         ret["start_time"] = local_start_time.time().isoformat()
         delta = utc_finish_time - utc_start_time
         # duration in milliseconds.microseconds
@@ -2452,10 +2562,24 @@ class State:
                         ]
                 else:
                     validated_retry_data[expected_key] = retry_defaults[expected_key]
+
+        elif isinstance(retry_data, bool):
+            if retry_data:
+                validated_retry_data = retry_defaults
+            else:
+                log.debug(
+                    "State is set with explicit retry: False so using default retry configuration with 0 attempts"
+                )
+                validated_retry_data = {
+                    "until": True,
+                    "attempts": 0,
+                    "splay": 0,
+                    "interval": 30,
+                }
         else:
             log.warning(
-                "State is set to retry, but a valid dict for retry "
-                "configuration was not found.  Using retry defaults"
+                "State is set to retry, but retry: True or a valid dict for "
+                "retry configuration was not found.  Using retry defaults"
             )
             validated_retry_data = retry_defaults
         return validated_retry_data
@@ -2463,11 +2587,25 @@ class State:
     def call_chunks(
         self,
         chunks: Sequence[LowChunk],
-        disabled_states: Optional[dict[str, dict[str, Any]]] = None,
+        disabled_states: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         Iterate over a list of chunks and call them, checking for requires.
         """
+
+        def _call_pending(
+            pending: dict[str, LowChunk], running: dict[str, dict]
+        ) -> tuple[dict[str, LowChunk], dict[str, dict], bool]:
+            still_pending = {}
+            for tag, pend in pending.items():
+                if tag not in running:
+                    running, is_pending = self.call_chunk(pend, running, chunks)
+                    if is_pending:
+                        still_pending[tag] = pend
+                    if self.check_failhard(pend, running):
+                        return still_pending, running, True
+            return still_pending, running, False
+
         if disabled_states is None:
             # Check for any disabled states
             disabled = {}
@@ -2476,24 +2614,38 @@ class State:
         else:
             disabled = disabled_states
         running = {}
+        pending_chunks = {}
         for low in chunks:
+            pending_chunks, running, failhard = _call_pending(pending_chunks, running)
+            if failhard:
+                return running
             if "__FAILHARD__" in running:
                 running.pop("__FAILHARD__")
                 return running
+            # Start any queued states when state_max_parallel has been hit previously
+            self.reconcile_procs(running)
+
             tag = _gen_tag(low)
             if tag not in running:
                 # Check if this low chunk is paused
                 action = self.check_pause(low)
                 if action == "kill":
                     break
-                running = self.call_chunk(low, running, chunks)
+                running, pending = self.call_chunk(low, running, chunks)
+                if pending:
+                    pending_chunks[tag] = low
                 if self.check_failhard(low, running):
                     return running
+        while pending_chunks:
+            pending_chunks, running, failhard = _call_pending(pending_chunks, running)
+            if failhard:
+                return running
+            time.sleep(0.01)
         while True:
             if self.reconcile_procs(running):
                 break
             time.sleep(0.01)
-        ret = dict(list(disabled.items()) + list(running.items()))
+        ret = {**disabled, **running}
         return ret
 
     def check_failhard(self, low: LowChunk, running: dict[str, dict]):
@@ -2509,7 +2661,7 @@ class State:
             return not running[tag]["result"]
         return False
 
-    def check_pause(self, low: LowChunk) -> Optional[str]:
+    def check_pause(self, low: LowChunk) -> str | None:
         """
         Check to see if this low chunk has been paused
         """
@@ -2556,41 +2708,59 @@ class State:
                 return "run"
         return "run"
 
+    def check_max_parallel(self) -> bool:
+        """
+        Check whether an additional ``parallel`` state can be started.
+        """
+        if not (allowed := self.opts.get("state_max_parallel")):
+            return True
+        cnt = sum(bool(parallel) is True for parallel in self.procs.values())
+        return cnt < allowed
+
     def reconcile_procs(self, running: dict) -> bool:
         """
         Check the running dict for processes and resolve them
         """
         retset = set()
-        for tag in running:
-            proc = running[tag].get("proc")
-            if proc:
-                if not proc.is_alive():
-                    ret_cache = os.path.join(
-                        self.opts["cachedir"],
-                        self.jid,
-                        salt.utils.hashutils.sha1_digest(tag),
-                    )
-                    if not os.path.isfile(ret_cache):
-                        ret = {
-                            "result": False,
-                            "comment": "Parallel process failed to return",
-                            "name": running[tag]["name"],
-                            "changes": {},
-                        }
-                    try:
-                        with salt.utils.files.fopen(ret_cache, "rb") as fp_:
-                            ret = msgpack_deserialize(fp_.read())
-                    except OSError:
-                        ret = {
-                            "result": False,
-                            "comment": "Parallel cache failure",
-                            "name": running[tag]["name"],
-                            "changes": {},
-                        }
-                    running[tag].update(ret)
-                    running[tag].pop("proc")
-                else:
-                    retset.add(False)
+        # Cannot iterate over the dict itself, need to pop items from the dictionary later
+        for tag in list(self.procs):
+            if tag not in running:
+                # When checking requisites, this function is called with a filtered
+                # running dict. This tag is not part of the requisites, so skip it.
+                continue
+            parallel = self.procs[tag]
+            if parallel.proc is None:
+                if self.check_max_parallel():
+                    parallel.start()
+                    running[tag]["comment"] = "Started in a separate process"
+                retset.add(False)
+            elif not parallel.proc.is_alive():
+                ret_cache = os.path.join(
+                    self.opts["cachedir"],
+                    self.invocation_id,
+                    salt.utils.hashutils.sha1_digest(tag),
+                )
+                if not os.path.isfile(ret_cache):
+                    ret = {
+                        "result": False,
+                        "comment": "Parallel process failed to return",
+                        "name": running[tag]["name"],
+                        "changes": {},
+                    }
+                try:
+                    with salt.utils.files.fopen(ret_cache, "rb") as fp_:
+                        ret = msgpack_deserialize(fp_.read())
+                except OSError:
+                    ret = {
+                        "result": False,
+                        "comment": "Parallel cache failure",
+                        "name": running[tag]["name"],
+                        "changes": {},
+                    }
+                running[tag].update(ret)
+                self.procs.pop(tag)
+            else:
+                retset.add(False)
         return False not in retset
 
     def _check_requisites(self, low: LowChunk, running: dict[str, dict[str, Any]]):
@@ -2599,6 +2769,7 @@ class State:
         states.
         """
         reqs = {}
+        pending = False
         for req_type, chunk in self.dependency_dag.get_dependencies(low):
             reqs.setdefault(req_type, []).append(chunk)
         fun_stats = set()
@@ -2618,15 +2789,20 @@ class State:
                     filtered_run_dict[tag] = run_dict_chunk
             run_dict = filtered_run_dict
 
-            while True:
-                if self.reconcile_procs(run_dict):
-                    break
-                time.sleep(0.01)
+            if low.get("parallel"):
+                pending = not self.reconcile_procs(run_dict)
+            else:
+                while True:
+                    if self.reconcile_procs(run_dict):
+                        break
+                    time.sleep(0.01)
 
             for chunk in chunks:
                 tag = _gen_tag(chunk)
                 if tag not in run_dict:
                     req_stats.add("unmet")
+                    continue
+                if pending:
                     continue
                 # A state can include a "skip_req" key in the return dict
                 # with a True value to skip triggering onchanges, watch, or
@@ -2684,6 +2860,8 @@ class State:
 
         if "unmet" in fun_stats:
             status = "unmet"
+        elif pending:
+            status = "pending"
         elif "fail" in fun_stats:
             status = "fail"
         elif "skip_req" in fun_stats and (fun_stats & {"onchangesmet", "premet"}):
@@ -2709,7 +2887,7 @@ class State:
         return status, reqs
 
     def event(
-        self, chunk_ret: dict, length: int, fire_event: Union[bool, str] = False
+        self, chunk_ret: dict, length: int, fire_event: bool | str = False
     ) -> None:
         """
         Fire an event on the master bus
@@ -2765,7 +2943,7 @@ class State:
         running: dict[str, dict],
         chunks: Sequence[LowChunk],
         depth: int = 0,
-    ) -> dict[str, dict]:
+    ) -> tuple[dict[str, dict], bool]:
         """
         Execute the chunk if the requisites did not fail
         """
@@ -2781,8 +2959,13 @@ class State:
 
         status, reqs = self._check_requisites(low, running)
         if status == "unmet":
-            if self._call_unmet_requisites(low, running, chunks, tag, depth):
-                return running
+            running_failhard, pending = self._call_unmet_requisites(
+                low, running, chunks, tag, depth
+            )
+            if running_failhard or pending:
+                return running, pending
+        elif status == "pending":
+            return running, True
         elif status == "met":
             if low.get("__prereq__"):
                 self.pre[tag] = self.call(low, chunks, running)
@@ -2910,7 +3093,7 @@ class State:
                 for key in ("__sls__", "__id__", "name"):
                     running[sub_tag][key] = low.get(key)
 
-        return running
+        return running, False
 
     def _assign_not_run_result_dict(
         self,
@@ -2944,16 +3127,19 @@ class State:
         chunks: Sequence[LowChunk],
         tag: str,
         depth: int,
-    ) -> dict[str, dict]:
+    ) -> tuple[dict[str, dict], bool]:
+        pending = False
         for _, chunk in self.dependency_dag.get_dependencies(low):
             # Check to see if the chunk has been run, only run it if
             # it has not been run already
             ctag = _gen_tag(chunk)
             if ctag not in running:
-                running = self.call_chunk(chunk, running, chunks)
+                running, pending = self.call_chunk(chunk, running, chunks)
+                if pending:
+                    return running, pending
                 if self.check_failhard(chunk, running):
                     running["__FAILHARD__"] = True
-                    return running
+                    return running, pending
         if low.get("__prereq__"):
             status, _ = self._check_requisites(low, running)
             self.pre[tag] = self.call(low, chunks, running)
@@ -2975,11 +3161,11 @@ class State:
                 for key in ("__sls__", "__id__", "name"):
                     running[tag][key] = low.get(key)
             else:
-                running = self.call_chunk(low, running, chunks, depth)
+                running, pending = self.call_chunk(low, running, chunks, depth)
         if self.check_failhard(low, running):
             running["__FAILHARD__"] = True
-            return running
-        return {}
+            return running, pending
+        return {}, pending
 
     def call_beacons(self, chunks: Iterable[LowChunk], running: dict) -> dict:
         """
@@ -3105,8 +3291,8 @@ class State:
         return running
 
     def call_high(
-        self, high: HighData, orchestration_jid: Union[str, int, None] = None
-    ) -> Union[dict, list]:
+        self, high: HighData, orchestration_jid: str | int | None = None
+    ) -> dict | list:
         """
         Process a high data call and ensure the defined states.
         """
@@ -3290,7 +3476,7 @@ class LazyAvailStates:
 
     def __init__(self, hs: BaseHighState):
         self._hs = hs
-        self._avail: dict[Hashable, Optional[list[str]]] = {"base": None}
+        self._avail: dict[Hashable, list[str] | None] = {"base": None}
         self._filled = False
 
     def _fill(self) -> None:

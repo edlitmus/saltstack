@@ -24,7 +24,8 @@ def username_str(user):
         try:
             user.delete(_username, purge=True, force=True)
         except Exception:  # pylint: disable=broad-except
-            # The point here is just system cleanup. It can fail if no account was created
+            # The point here is just system cleanup. It can fail if no account
+            # was created
             pass
 
 
@@ -213,6 +214,19 @@ def test_info_int(user, account_int):
     assert ret["uid"].startswith("S-1-5")
 
 
+def test_info_domain_local(user, account_str):
+    domain = "."  # localhost or hostname doesn't work, only .
+    ret = user.info(f"{domain}\\{account_str.username}")
+    assert ret["name"] == account_str.username
+    assert ret["uid"].startswith("S-1-5")
+
+
+def test_info_domain_not_found(user, account_str):
+    domain = "junk.com"
+    ret = user.info(f"{domain}\\{account_str.username}")
+    assert ret == {}
+
+
 def test_list_groups_str(user, account_str):
     ret = user.list_groups(account_str.username)
     assert ret == ["Users"]
@@ -223,9 +237,9 @@ def test_list_groups_int(user, account_int):
     assert ret == ["Users"]
 
 
-def test_list_users(user):
+def test_list_users(user, account_str):
     ret = user.list_users()
-    assert "Administrator" in ret
+    assert account_str.username in ret
 
 
 def test_removegroup_str(user, account_str):

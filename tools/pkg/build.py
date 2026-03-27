@@ -10,6 +10,7 @@ import logging
 import os
 import os.path
 import pathlib
+import re
 import shutil
 import tarfile
 import zipfile
@@ -131,6 +132,10 @@ def debian(
         "arch": {
             "help": "The arch to build for",
         },
+        "key_id": {
+            "help": "Signing key id",
+            "required": False,
+        },
     },
 )
 def rpm(
@@ -139,10 +144,12 @@ def rpm(
     relenv_version: str = None,
     python_version: str = None,
     arch: str = None,
+    key_id: str = None,
 ):
     """
     Build the RPM package.
     """
+    onci = "GITHUB_WORKFLOW" in os.environ
     checkout = pathlib.Path.cwd()
     if onedir:
         onedir_artifact = checkout / "artifacts" / onedir
@@ -184,7 +191,25 @@ def rpm(
     ctx.run(
         "rpmbuild", "-bb", f"--define=_salt_src {checkout}", str(spec_file), env=env
     )
-
+    if key_id:
+        if onci:
+            path = "/github/home/rpmbuild/RPMS/"
+        else:
+            path = "~/rpmbuild/RPMS/"
+        pkgs = list(pathlib.Path(path).glob("**/*.rpm"))
+        if not pkgs:
+            ctx.error("Signing requested but no packages found.")
+            ctx.exit(1)
+        for pkg in pkgs:
+            ctx.info(f"Running 'rpmsign' on {pkg} ...")
+            ctx.run(
+                "rpmsign",
+                "--key-id",
+                key_id,
+                "--addsign",
+                "--digest-algo=sha256",
+                str(pkg),
+            )
     ctx.info("Done")
 
 
@@ -315,6 +340,9 @@ def macos(
         "python_version": {
             "help": "The version of python to build with using relenv",
         },
+        "debug_signing": {
+            "help": "Enable verbose logging for signtool",
+        },
     },
 )
 def windows(
@@ -325,6 +353,7 @@ def windows(
     sign: bool = False,
     relenv_version: str = None,
     python_version: str = None,
+    debug_signing: bool = True,
 ):
     """
     Build the Windows package.
@@ -398,14 +427,20 @@ def windows(
             ]
         )
         env["PATH"] = os.pathsep.join(path_parts)
+        command = ["smksp_registrar.exe", "register"]
+        ctx.info(f"Running: '{' '.join(command)}' ...")
+        ctx.run(*command, env=env)
+
         command = ["smksp_registrar.exe", "list"]
         ctx.info(f"Running: '{' '.join(command)}' ...")
         ctx.run(*command, env=env)
+
         command = ["smctl.exe", "keypair", "ls"]
         ctx.info(f"Running: '{' '.join(command)}' ...")
         ret = ctx.run(*command, env=env, check=False)
         if ret.returncode:
             ctx.error(f"Failed to run '{' '.join(command)}'")
+
         command = [
             r"C:\Windows\System32\certutil.exe",
             "-csp",
@@ -418,11 +453,53 @@ def windows(
         if ret.returncode:
             ctx.error(f"Failed to run '{' '.join(command)}'")
 
+        # DIGICERT asked me to add this for troubleshooting
+        command = ["smctl.exe", "healthcheck"]
+        ctx.info("Running Health Check...")
+        ret = ctx.run(*command, env=env, check=False)
+        if ret.returncode:
+            ctx.error(f"Failed to run '{' '.join(command)}'")
+
         command = ["smksp_cert_sync.exe"]
         ctx.info(f"Running: '{' '.join(command)}' ...")
         ret = ctx.run(*command, env=env, check=False)
         if ret.returncode:
             ctx.error(f"Failed to run '{' '.join(command)}'")
+        ctx.info(f"{list(pathlib.Path('~/.signingmanager/logs/').glob('*'))}")
+        ctx.run(
+            "powershell.exe",
+            "-C",
+            'Get-WinEvent -LogName "*Microsoft-Windows-AppxPackaging*" -MaxEvents 150',
+            check=False,
+        )
+        ctx.run("smctl.exe", "windows", "certsync", check=False)
+
+        # sign_cmd = ["signtool.exe", "sign"]
+        # if debug_signing:
+        #    sign_cmd.extend(["/v", "/debug"])
+
+        # sign_cmd.extend(
+        #    [
+        #        "/sha1",
+        #        os.environ["WIN_SIGN_CERT_SHA1_HASH"],
+        #        "/tr",
+        #        "http://timestamp.digicert.com",
+        #        "/td",
+        #        "SHA256",
+        #        "/fd",
+        #        "SHA256",
+        #    ]
+        # )
+        sign_cmd = [
+            "smctl.exe",
+            "sign",
+            "-v",
+            "--fingerprint",
+            os.environ["WIN_SIGN_CERT_SHA1_HASH"],
+            "--config-file",
+            "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\smtools-windows-x64\\pkcs11properties.cfg",
+            "--input",
+        ]
 
         for fname in (
             f"pkg/windows/build/Salt-Minion-{salt_version}-Py3-{arch}-Setup.exe",
@@ -430,18 +507,9 @@ def windows(
         ):
             fpath = str(pathlib.Path(fname).resolve())
             ctx.info(f"Signing {fname} ...")
+            cmd = sign_cmd[:] + [fpath]
             ctx.run(
-                "signtool.exe",
-                "sign",
-                "/sha1",
-                os.environ["WIN_SIGN_CERT_SHA1_HASH"],
-                "/tr",
-                "http://timestamp.digicert.com",
-                "/td",
-                "SHA256",
-                "/fd",
-                "SHA256",
-                fpath,
+                *cmd,
                 env=env,
             )
             ctx.info(f"Verifying {fname} ...")
@@ -546,18 +614,35 @@ def onedir_dependencies(
     )
 
     env = os.environ.copy()
-    install_args = ["-v"]
+    install_args = [
+        "-v",
+        "--use-pep517",
+        "--no-cache-dir",
+        "--only-binary=maturin,apache-libcloud,pymssql",
+    ]
     if platform == "windows":
         python_bin = env_scripts_dir / "python"
     else:
         env["RELENV_BUILDENV"] = "1"
         python_bin = env_scripts_dir / "python3"
-        install_args.extend(
-            [
-                "--use-pep517",
-                "--no-cache-dir",
-                "--no-binary=:all:",
-            ]
+        install_args.append("--no-binary=:all:")
+        install_args.append(
+            "--only-binary=maturin,apache-libcloud,pymssql,cassandra-driver"
+        )
+
+    # Cryptography needs openssl dir set to link to the proper openssl libs.
+    if platform == "macos":
+        env["OPENSSL_DIR"] = f"{dest}"
+
+    if platform == "linux":
+        # This installs the ppbt package. We'll remove it after installing all
+        # of our python packages.
+        ctx.run(
+            str(python_bin),
+            "-m",
+            "pip",
+            "install",
+            "relenv[toolchain]",
         )
 
     version_info = ctx.run(
@@ -713,6 +798,15 @@ def salt_onedir(
     else:
         env["RELENV_PIP_DIR"] = "1"
         pip_bin = env_scripts_dir / "pip3"
+        if platform == "linux":
+            # This installs the ppbt package. We'll remove it after installing all
+            # of our python packages.
+            ctx.run(
+                str(pip_bin),
+                "install",
+                "relenv[toolchain]",
+            )
+
         ctx.run(
             str(pip_bin),
             "install",
@@ -769,11 +863,99 @@ def salt_onedir(
         ctx.info(f"Copying '{src.relative_to(tools.utils.REPO_ROOT)}' to '{dst}' ...")
         shutil.copyfile(src, dst)
 
+    if platform == "linux":
+        # The ppbt package is very large. It is only needed when installing
+        # python modules that need to be compiled. Do not ship ppbt by default,
+        # it can be installed later if needed.
+        ctx.run(
+            str(python_executable),
+            "-m",
+            "pip",
+            "uninstall",
+            "-y",
+            "ppbt",
+        )
+
     # Add package type file for package grain
     with open(
         pathlib.Path(site_packages) / "salt" / "_pkg.txt", "w", encoding="utf-8"
     ) as fp:
         fp.write("onedir")
+
+    # Update virtualenv embedded wheels
+    embed_dir = pathlib.Path(site_packages) / "virtualenv" / "seed" / "wheels" / "embed"
+    # clear existing wheels
+    if embed_dir.exists():
+        for file in embed_dir.glob("*.whl"):
+            try:
+                file.unlink()
+            except Exception as e:
+                log.error("Error deleting %s: %s", file.name, e)
+    else:
+        embed_dir.mkdir(parents=True, exist_ok=True)
+
+    # download new virtualenv embedded wheels
+    env["PIP_CONSTRAINT"] = str(
+        tools.utils.REPO_ROOT / "requirements" / "constraints.txt"
+    )
+    ctx.run(
+        str(python_executable),
+        "-m",
+        "pip",
+        "download",
+        "setuptools",
+        "pip",
+        "wheel",
+        "--dest",
+        str(embed_dir),
+    )
+
+    # Update __init__.py with the new versions
+
+    # 1. Identify the new wheel versions on disk
+    wheels = list(embed_dir.glob("*.whl"))
+
+    def get_latest(name):
+        # Finds the wheel with the highest version number for a given package name
+        matches = [w.name for w in wheels if w.name.startswith(name + "-")]
+        return sorted(matches, reverse=True)[0] if matches else None
+
+    new_pip = get_latest("pip")
+    new_setuptools = get_latest("setuptools")
+    new_wheel = get_latest("wheel")
+
+    if not all([new_pip, new_setuptools]):
+        log.debug("Error: Could not find new wheels to map in __init__.py")
+    else:
+
+        # 2. Read the current __init__.py content
+        init_file = embed_dir / "__init__.py"
+        content = init_file.read_text()
+
+        # 3. Use Regex to replace the specific filenames globally in the BUNDLE_SUPPORT dict
+        # This targets the specific quoted strings for each package type
+        content = re.sub(
+            r'("pip":\s*")([^"]+)"',
+            f'\\1{new_pip}"',
+            content,
+        )
+        content = re.sub(
+            r'("setuptools":\s*")([^"]+)"',
+            f'\\1{new_setuptools}"',
+            content,
+        )
+        content = re.sub(
+            r'("wheel":\s*")([^"]+)"',
+            f'\\1{new_wheel}"',
+            content,
+        )
+
+        # 4. Write the updated file back
+        init_file.write_text(content)
+        log.debug("Updated %s with:", init_file.name)
+        log.debug(
+            "Pip: %s\nSetuptools: %s\nWheel: %s", new_pip, new_setuptools, new_wheel
+        )
 
 
 def _check_pkg_build_files_exist(ctx: Context, **kwargs):

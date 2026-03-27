@@ -72,6 +72,7 @@ import fnmatch
 import logging
 import os
 import re
+from collections import OrderedDict as _OrderedDict
 
 import salt.utils.args
 import salt.utils.pkg
@@ -81,7 +82,6 @@ from salt.exceptions import CommandExecutionError, MinionError, SaltInvocationEr
 from salt.modules.pkg_resource import _repack_pkgs
 from salt.output import nested
 from salt.utils.functools import namespaced_function
-from salt.utils.odict import OrderedDict as _OrderedDict
 
 _repack_pkgs = namespaced_function(_repack_pkgs, globals())
 
@@ -743,7 +743,15 @@ def _find_install_targets(
     warnings = []
     failed_verify = False
     for package_name, version_string in desired.items():
-        cver = cur_pkgs.get(package_name, [])
+
+        # FreeBSD pkg supports `openjdk` and `java/openjdk7` package names
+        origin = bool(re.search("/", package_name))
+
+        if __grains__["os"] == "FreeBSD" and origin:
+            cver = [k for k, v in cur_pkgs.items() if v["origin"] == package_name]
+        else:
+            cver = cur_pkgs.get(package_name, [])
+
         if resolve_capabilities and not cver and package_name in cur_prov:
             cver = cur_pkgs.get(cur_prov.get(package_name)[0], [])
 
@@ -2964,7 +2972,7 @@ def _uninstall(
 
     try:
         pkg_params = __salt__["pkg_resource.parse_targets"](
-            name, pkgs, normalize=normalize
+            name, pkgs, normalize=normalize, version=version, **kwargs
         )[0]
     except MinionError as exc:
         return {
@@ -3031,7 +3039,7 @@ def _uninstall(
     new = __salt__["pkg.list_pkgs"](versions_as_list=True, **kwargs)
     failed = []
     for param in pkg_params:
-        if __grains__["os_family"] in ["Suse", "RedHat"]:
+        if __grains__["os_family"] in ["Suse", "RedHat", "Windows"]:
             # Check if the package version set to be removed is actually removed:
             if param in new and not pkg_params[param]:
                 failed.append(param)
@@ -3652,7 +3660,7 @@ def mod_aggregate(low, chunks, running):
         # the URI for sources
         low_pkgs_list = [
             name if value is None else {name: value}
-            for name, values in pkgs.items()
+            for name, values in low_pkgs.items()
             for value in values
         ]
         low[pkg_type] = low_pkgs_list

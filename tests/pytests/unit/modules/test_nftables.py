@@ -123,6 +123,25 @@ def test_build_rule():
         "comment": "Successfully built rule",
     }
 
+    assert nftables.build_rule(
+        **{
+            "table": "filter",
+            "chain": "input",
+            "family": "ip6",
+            "command": "add",
+            "icmpv6-type": "echo-request,echo-reply",
+            "jump": "accept",
+            "full": "True",
+        }
+    ) == {
+        "result": True,
+        "rule": (
+            "nft add rule ip6 filter input icmpv6 type {"
+            " echo-request,echo-reply } accept"
+        ),
+        "comment": "Successfully built rule",
+    }
+
     assert nftables.build_rule() == {"result": True, "rule": "", "comment": ""}
 
 
@@ -1062,3 +1081,18 @@ def test_set_policy():
             assert nftables.set_policy(
                 table="filter", chain="input", policy="accept", family="ipv4"
             )
+
+
+@pytest.mark.parametrize(
+    "rule",
+    ["ct state { new } tcp dport { 22 } accept", "ct state new tcp dport 22 accept"],
+)
+def test_check_should_handles_braces_for_single_value_returns(rule):
+    ret = {
+        "result": True,
+        "comment": f"Rule {rule} in chain input in table filter in family ipv4 exists",
+    }
+    nft_list_out = "table ip filter {\n\tchain input { # handle 1\n\t\tct state new tcp dport 22 accept # handle 6\n\t}\n}"
+    mock = MagicMock(return_value=nft_list_out)
+    with patch.dict(nftables.__salt__, {"cmd.run": mock}):
+        assert nftables.check(chain="input", rule=rule) == ret

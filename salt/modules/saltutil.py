@@ -126,8 +126,8 @@ def _sync(form, saltenv=None, extmod_whitelist=None, extmod_blacklist=None):
 def update(version=None):
     """
     Update the salt minion from the URL defined in opts['update_url']
-    VMware, Inc provides the latest builds here:
-    update_url: https://repo.saltproject.io/windows/
+    Broadcom, Inc provides the latest builds here:
+    update_url: https://packages.broadcom.com/artifactory/saltproject-generic/windows/
 
     Be aware that as of 2014-8-11 there's a bug in esky such that only the
     latest version available in the update_url can be downloaded and installed.
@@ -1487,6 +1487,40 @@ def find_job(jid):
     for data in running():
         if data["jid"] == jid:
             return data
+
+    # Check queues if not found in running
+    # This ensures that we don't report "not found" for jobs that are waiting in queue
+    for queue_name in ("state_queue", "job_queue"):
+        queue_dir = os.path.join(__opts__["cachedir"], queue_name)
+        if not os.path.isdir(queue_dir):
+            continue
+
+        try:
+            # Check for files matching the JID
+            # Queue files are named queued_<timestamp>_<jid>.p
+            suffix = f"_{jid}.p"
+            for fn in os.listdir(queue_dir):
+                if fn.endswith(suffix):
+                    path = os.path.join(queue_dir, fn)
+                    try:
+                        with salt.utils.files.fopen(path, "rb") as fp_:
+                            data = salt.payload.load(fp_)
+
+                        # Decorate the data to indicate it is queued
+                        # We return a structure similar to running() so it's compatible
+                        # but with empty/zero PID to indicate it's not actually running yet
+                        if isinstance(data, dict):
+                            data.setdefault("pid", 0)
+                            data["queued"] = True
+                            data["queue_type"] = queue_name
+                            return data
+                    except (OSError, ValueError):
+                        # File might have moved or is corrupt
+                        continue
+        except OSError:
+            # Cannot read directory
+            continue
+
     return {}
 
 
@@ -1679,11 +1713,9 @@ def revoke_auth(preserve_minion_cache=False):
         with salt.channel.client.ReqChannel.factory(
             __opts__, master_uri=master
         ) as channel:
-            tok = channel.auth.gen_token(b"salt")
             load = {
                 "cmd": "revoke_auth",
                 "id": __opts__["id"],
-                "tok": tok,
                 "preserve_minion_cache": preserve_minion_cache,
             }
             try:

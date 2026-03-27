@@ -14,6 +14,7 @@ import pytest
 from saltfactories.utils import random_string
 
 import salt.utils.files
+import salt.utils.path
 import salt.utils.platform
 
 try:
@@ -143,7 +144,9 @@ def test_user_present_nondefault(grains, modules, states, username, user_home):
     if not salt.utils.platform.is_darwin() and not salt.utils.platform.is_windows():
         assert user_home.is_dir()
 
-    if grains["os_family"] in ("Suse",):
+    if grains["os_family"] == "Suse" and not (
+        grains.get("transactional", False) or grains.get("osmajorrelease", 0) >= 16
+    ):
         expected_group_name = "users"
     elif grains["os_family"] == "MacOS":
         expected_group_name = "staff"
@@ -314,6 +317,27 @@ def test_user_present_home_directory_created(modules, states, username, createho
     assert pathlib.Path(user_info["home"]).is_dir() is createhome
 
 
+@pytest.mark.skip_on_windows(reason="windows minion does not support persist_home")
+@pytest.mark.skip_on_darwin(reason="Mac minion does not support persist_home")
+@pytest.mark.parametrize("persist_home", [True, False])
+def test_user_present_home_directory_persisted(
+    modules, states, existing_account, user_home, persist_home
+):
+    """
+    It ensures that the home directory is persisted when home changed.
+    """
+    pathlib.Path(existing_account.info.home, "testfile").touch()
+    ret = states.user.present(
+        name=existing_account.username, home=str(user_home), persist_home=persist_home
+    )
+    assert ret.result is True
+
+    user_info = modules.user.info(existing_account.info.name)
+    assert user_info
+
+    assert pathlib.Path(user_info["home"], "testfile").is_file() is persist_home
+
+
 @pytest.mark.skip_on_darwin(reason="groups/gid not fully supported")
 @pytest.mark.skip_on_windows(reason="groups/gid not fully supported")
 def test_user_present_change_gid_but_keep_group(
@@ -386,7 +410,15 @@ def test_user_present_existing(states, username):
 
 
 @pytest.mark.skip_unless_on_linux(reason="underlying functionality only runs on Linux")
-def test_user_present_change_groups(modules, states, username, group_1, group_2):
+def test_user_present_change_groups(
+    grains, modules, states, username, group_1, group_2
+):
+    expected_groups = [group_2.name, group_1.name]
+    if grains["os_family"] == "Suse" and (
+        grains.get("transactional", False) or grains.get("osmajorrelease", 0) >= 16
+    ):
+        expected_groups.append(username)
+
     ret = states.user.present(
         name=username,
         groups=[group_1.name, group_2.name],
@@ -395,7 +427,9 @@ def test_user_present_change_groups(modules, states, username, group_1, group_2)
 
     user_info = modules.user.info(username)
     assert user_info
-    assert user_info["groups"] == [group_2.name, group_1.name]
+    assert sorted(user_info["groups"]) == sorted(expected_groups)
+
+    expected_groups.remove(group_2.name)
 
     # run again and remove group_2
     ret = states.user.present(
@@ -406,13 +440,19 @@ def test_user_present_change_groups(modules, states, username, group_1, group_2)
 
     user_info = modules.user.info(username)
     assert user_info
-    assert user_info["groups"] == [group_1.name]
+    assert sorted(user_info["groups"]) == sorted(expected_groups)
 
 
 @pytest.mark.skip_unless_on_linux(reason="underlying functionality only runs on Linux")
 def test_user_present_change_optional_groups(
-    modules, states, username, group_1, group_2
+    grains, modules, states, username, group_1, group_2
 ):
+    expected_groups = [group_2.name, group_1.name]
+    if grains["os_family"] == "Suse" and (
+        grains.get("transactional", False) or grains.get("osmajorrelease", 0) >= 16
+    ):
+        expected_groups.append(username)
+
     ret = states.user.present(
         name=username,
         optional_groups=[group_1.name, group_2.name],
@@ -421,7 +461,9 @@ def test_user_present_change_optional_groups(
 
     user_info = modules.user.info(username)
     assert user_info
-    assert user_info["groups"] == [group_2.name, group_1.name]
+    assert sorted(user_info["groups"]) == sorted(expected_groups)
+
+    expected_groups.remove(group_2.name)
 
     # run again and remove group_2
     ret = states.user.present(
@@ -432,7 +474,7 @@ def test_user_present_change_optional_groups(
 
     user_info = modules.user.info(username)
     assert user_info
-    assert user_info["groups"] == [group_1.name]
+    assert sorted(user_info["groups"]) == sorted(expected_groups)
 
 
 @pytest.fixture

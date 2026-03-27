@@ -72,6 +72,8 @@ def pkg_name(grains):
             _pkg = "units"
     elif grains["os_family"] == "Debian":
         _pkg = "ifenslave"
+    elif grains["os_family"] == "Suse":
+        _pkg = "wget"
     return _pkg
 
 
@@ -135,12 +137,8 @@ def test_mod_del_repo(grains, modules):
         elif grains["os_family"] == "RedHat":
             repo = "saltstack"
             name = "SaltStack repo for RHEL/CentOS {}".format(grains["osmajorrelease"])
-            baseurl = "https://repo.saltproject.io/py3/redhat/{}/x86_64/latest/".format(
-                grains["osmajorrelease"]
-            )
-            gpgkey = "https://repo.saltproject.io/py3/redhat/{}/x86_64/latest/SALTSTACK-GPG-KEY.pub".format(
-                grains["osmajorrelease"]
-            )
+            baseurl = "https://packages.broadcom.com/artifactory/saltproject-rpm/"
+            gpgkey = "https://packages.broadcom.com/artifactory/api/security/keypair/SaltProjectKey/public"
             gpgcheck = 1
             enabled = 1
             ret = modules.pkg.mod_repo(
@@ -222,6 +220,8 @@ def test_owner(modules, grains):
     binary = "/bin/ls"
     if grains["os"] == "Ubuntu" and grains["osmajorrelease"] >= 24:
         binary = "/usr/bin/ls"
+    if grains["os"] == "Debian" and grains["osmajorrelease"] >= 13:
+        binary = "/usr/bin/ls"
 
     ret = modules.pkg.owner(binary)
     assert len(ret) != 0
@@ -237,6 +237,8 @@ def test_which(modules, grains):
     binary = "/bin/ls"
     if grains["os"] == "Ubuntu" and grains["osmajorrelease"] >= 24:
         binary = "/usr/bin/ls"
+    elif grains["os"] == "Debian" and grains["osmajorrelease"] >= 13:
+        binary = "/usr/bin/ls"
     ret = modules.pkg.which(binary)
     assert len(ret) != 0
 
@@ -246,6 +248,10 @@ def test_which(modules, grains):
 @pytest.mark.requires_salt_modules("pkg.version", "pkg.install", "pkg.remove")
 @pytest.mark.slow_test
 @pytest.mark.requires_network
+@pytest.mark.skipif(
+    bool(salt.utils.path.which("transactional-update")),
+    reason="Skipping on transactional systems",
+)
 def test_install_remove(modules, pkg_name):
     """
     successfully install and uninstall a package
@@ -287,6 +293,10 @@ def test_install_remove(modules, pkg_name):
 @pytest.mark.slow_test
 @pytest.mark.requires_network
 @pytest.mark.requires_salt_states("pkg.installed")
+@pytest.mark.skipif(
+    bool(salt.utils.path.which("transactional-update")),
+    reason="Skipping on transactional systems",
+)
 def test_hold_unhold(grains, modules, states, pkg_name):
     """
     test holding and unholding a package
